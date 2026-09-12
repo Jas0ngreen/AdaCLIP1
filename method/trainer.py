@@ -21,6 +21,7 @@ class AdaCLIP_Trainer(nn.Module):
             prompting_depth=3, prompting_length=2,
             prompting_branch='VL', prompting_type='SD',
             use_hsf=True, k_clusters=20,
+            fusion_mode = "add",
     ):
 
         super(AdaCLIP_Trainer, self).__init__()
@@ -28,6 +29,7 @@ class AdaCLIP_Trainer(nn.Module):
         self.device = device
         self.feat_list = feat_list
         self.image_size = image_size
+        self.fusion_mode = fusion_mode
         self.prompting_branch = prompting_branch
         self.prompting_type = prompting_type
 
@@ -51,7 +53,8 @@ class AdaCLIP_Trainer(nn.Module):
                                   k_clusters=k_clusters,
                                   output_layers=feat_list,
                                   device=device,
-                                  image_size=image_size).to(device)
+                                  image_size=image_size,
+                                  fusion_mode=self.fusion_mode).to(device)
 
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -72,7 +75,9 @@ class AdaCLIP_Trainer(nn.Module):
             'patch_token_layer',
             'cls_token_layer',
             'dynamic_visual_prompt_generator',
-            'dynamic_text_prompt_generator'
+            'dynamic_text_prompt_generator',
+            "visual_gate_generator",
+            "text_gate_generator"
         ]
 
         self.params_to_update = []
