@@ -14,9 +14,12 @@ from tools import write2csv, setup_paths, setup_seed, log_metrics, Logger
 from dataset import get_data
 from method import AdaCLIP_Trainer
 
-setup_seed(111)
+# TODO 最后代码完成删掉
+#setup_seed(111)
 
 def train(args):
+    setup_seed(args.seed)
+
     # Configurations
     epochs = args.epoch
     learning_rate = args.learning_rate
@@ -61,7 +64,8 @@ def train(args):
         prompting_branch=args.prompting_branch,
         prompting_type=args.prompting_type,
         use_hsf=args.use_hsf,
-        k_clusters=args.k_clusters
+        k_clusters=args.k_clusters,
+        fusion_mode=args.fusion_mode,
     ).to(device)
 
     train_data_cls_names, train_data, train_data_root = get_data(
@@ -171,6 +175,38 @@ if __name__ == '__main__':
     parser.add_argument("--use_hsf", type=str2bool, default=True,
                         help="Use HSF for aggregation. If False, original class embedding is used (default: True)")
     parser.add_argument("--k_clusters", type=int, default=20, help="Number of clusters (default: 20)")
+
+    # 确保baseline可以复现
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=111,
+        help="Random seed"
+    )
+
+    # 加入融合参数模式
+    parser.add_argument(
+        "--fusion_mode",
+        type=str,
+        default="add",
+        choices=["add", "layer_gate", "residual_layer_gate"],
+        help="Static and dynamic prompt fusion method"
+    )
+
+    parser.add_argument(
+        "--static_warmup_epochs",
+        type=int,
+        default=0,
+        help="Number of epochs for static prompt warm-up"
+    )
+
+    # mu^D = 0.99* mu^D + 0.01*Mean(P^D(x))
+    parser.add_argument(
+        "--prompt_ema_momentum",
+        type=float,
+        default=0.99,
+        help="EMA momentum for dynamic prompt centering"
+    )
 
     args = parser.parse_args()
 
