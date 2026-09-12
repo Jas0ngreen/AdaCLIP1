@@ -1,0 +1,31 @@
+/result/
+/.idea/
+/__pycache__/
+/weights/
+# =========================
+# Local datasets
+# =========================
+datasets/
+dataset/*.zip
+
+# =========================
+# Experiment outputs
+# =========================
+workspaces/
+flagged/
+log.txt
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# =========================
+# OS / IDE
+# =========================
+.DS_Store
+.vscode/
+.idea/
