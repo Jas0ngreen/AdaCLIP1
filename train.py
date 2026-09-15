@@ -66,6 +66,7 @@ def train(args):
         use_hsf=args.use_hsf,
         k_clusters=args.k_clusters,
         fusion_mode=args.fusion_mode,
+        gate_learning_rate=args.gate_learning_rate,
     ).to(device)
 
     train_data_cls_names, train_data, train_data_root = get_data(
@@ -91,6 +92,9 @@ def train(args):
 
     for epoch in tqdm(range(epochs)):
         loss = model.train_epoch(train_dataloader)
+
+        epoch_ckp_path = f'{ckp_path}_epoch_{epoch + 1}.pth'
+        model.save(epoch_ckp_path)
 
         # Logs
         if (epoch + 1) % args.print_freq == 0:
@@ -194,6 +198,13 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        "--gate_learning_rate",
+        type=float,
+        default=0.001,
+        help="Learning rate for layer-wise Gate modules"
+    )
+
+    parser.add_argument(
         "--static_warmup_epochs",
         type=int,
         default=0,
@@ -215,4 +226,3 @@ if __name__ == '__main__':
             "Currently, only batch size of 1 is supported due to unresolved bugs. Please set --batch_size to 1.")
 
     train(args)
-

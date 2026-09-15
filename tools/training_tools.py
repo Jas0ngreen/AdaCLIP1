@@ -56,6 +56,9 @@ def setup_paths(args):
     if args.fusion_mode == 'residual_layer_gate':
         model_name += f'-M{args.prompt_ema_momentum:g}'
 
+    if args.fusion_mode in ('layer_gate', 'residual_layer_gate'):
+        model_name += f'-GLR{args.gate_learning_rate:g}'
+
     # prepare model path
     ckp_path = os.path.join(model_root, model_name)
 
@@ -77,4 +80,3 @@ def setup_paths(args):
     log_path = os.path.join(log_root, f'{model_name}-{args.testing_data}.txt')
 
     return model_name, image_dir, csv_path, log_path, ckp_path, tensorboard_logger
-

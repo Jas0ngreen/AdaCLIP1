@@ -21,7 +21,7 @@ class AdaCLIP_Trainer(nn.Module):
             prompting_depth=3, prompting_length=2,
             prompting_branch='VL', prompting_type='SD',
             use_hsf=True, k_clusters=20,
-            fusion_mode = "add",
+            fusion_mode="add", gate_learning_rate=0.001,
     ):
 
         super(AdaCLIP_Trainer, self).__init__()
@@ -30,6 +30,9 @@ class AdaCLIP_Trainer(nn.Module):
         self.feat_list = feat_list
         self.image_size = image_size
         self.fusion_mode = fusion_mode
+        if gate_learning_rate <= 0:
+            raise ValueError("gate_learning_rate must be positive.")
+        self.gate_learning_rate = gate_learning_rate
         self.prompting_branch = prompting_branch
         self.prompting_type = prompting_type
 
@@ -69,27 +72,58 @@ class AdaCLIP_Trainer(nn.Module):
         self.preprocess.transforms[1] = transforms.CenterCrop(size=(image_size, image_size))
 
         # update parameters
-        self.learnable_paramter_list = [
+        self.base_parameter_names = [
             'text_prompter',
             'visual_prompter',
             'patch_token_layer',
             'cls_token_layer',
             'dynamic_visual_prompt_generator',
             'dynamic_text_prompt_generator',
-            "visual_gate_generator",
-            "text_gate_generator"
         ]
 
-        self.params_to_update = []
-        for name, param in self.clip_model.named_parameters():
-            # print(name)
-            for update_name in self.learnable_paramter_list:
-                if update_name in name:
-                    # print(f'updated parameters--{name}: {update_name}')
-                    self.params_to_update.append(param)
+        self.gate_parameter_names = [
+            "visual_gate_generator",
+            "text_gate_generator",
+        ]
+
+        self.learnable_paramter_list = (
+            self.base_parameter_names
+            + self.gate_parameter_names
+        )
+
+        base_parameters = []
+        gate_parameters = []
+
+        for name, parameter in self.clip_model.named_parameters():
+            if any(gate_name in name for gate_name in self.gate_parameter_names):
+                gate_parameters.append(parameter)
+            elif any(base_name in name for base_name in self.base_parameter_names):
+                base_parameters.append(parameter)
+
+        self.params_to_update = base_parameters + gate_parameters
+
+        optimizer_groups = [
+            {
+                "params": base_parameters,
+                "lr": learning_rate,
+                "weight_decay": 0.01,
+            },
+        ]
+
+        if gate_parameters:
+            optimizer_groups.append(
+                {
+                    "params": gate_parameters,
+                    "lr": self.gate_learning_rate,
+                    "weight_decay": 0.0,
+                }
+            )
 
         # build the optimizer
-        self.optimizer = torch.optim.AdamW(self.params_to_update, lr=learning_rate, betas=(0.5, 0.999))
+        self.optimizer = torch.optim.AdamW(
+            optimizer_groups,
+            betas=(0.5, 0.999),
+        )
 
     def save(self, path):
         self.save_dict = {}
@@ -227,4 +261,3 @@ class AdaCLIP_Trainer(nn.Module):
         metric_dict['Average'] = calculate_average_metric(metric_dict)
 
         return metric_dict
-
