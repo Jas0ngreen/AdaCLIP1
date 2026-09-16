@@ -188,9 +188,47 @@ class AdaCLIP_Trainer(nn.Module):
 
         return np.mean(loss_list)
 
+    @staticmethod
+    def summarize_gate_values(gate_values):
+        gate_statistics = {}
+
+        for branch, collected_gates in gate_values.items():
+            if not collected_gates:
+                continue
+
+            gates = torch.cat(collected_gates, dim=0)
+            branch_statistics = []
+
+            for layer in range(gates.shape[1]):
+                values = gates[:, layer]
+                branch_statistics.append(
+                    {
+                        'mean': values.mean().item(),
+                        'std': values.std(unbiased=False).item(),
+                        'min': values.min().item(),
+                        'max': values.max().item(),
+                        'p01': torch.quantile(values, 0.01).item(),
+                        'p99': torch.quantile(values, 0.99).item(),
+                        'near0': (values < 0.05).float().mean().item(),
+                        'near2': (values > 1.95).float().mean().item(),
+                    }
+                )
+
+            gate_statistics[branch] = branch_statistics
+
+        return gate_statistics
+
     @torch.no_grad()
-    def evaluation(self, dataloader, obj_list, save_fig, save_fig_dir=None):
+    def evaluation(self, dataloader, obj_list, save_fig, save_fig_dir=None, collect_gate_stats=False):
         self.clip_model.eval()
+
+        self.last_gate_statistics = {}
+        gate_values = None
+        if collect_gate_stats:
+            gate_values = {
+                'visual': [],
+                'text': [],
+            }
 
         results = {}
         results['cls_names'] = []
@@ -226,6 +264,20 @@ class AdaCLIP_Trainer(nn.Module):
                 # pixel level
                 anomaly_map, anomaly_score = self.clip_model(image, cls_name, aggregation=True)
 
+                if gate_values is not None:
+                    visual_gates = self.clip_model.visual_prompter.dynamic_gates
+                    text_gates = self.clip_model.text_prompter.dynamic_gates
+
+                    if visual_gates is not None:
+                        gate_values['visual'].append(
+                            visual_gates.detach().float().cpu()
+                        )
+
+                    if text_gates is not None:
+                        gate_values['text'].append(
+                            text_gates.detach().float().cpu()
+                        )
+
                 anomaly_map = anomaly_map.cpu().numpy()
                 anomaly_score = anomaly_score.cpu().numpy()
 
@@ -259,5 +311,8 @@ class AdaCLIP_Trainer(nn.Module):
             metric_dict[obj_full_name] = metric
 
         metric_dict['Average'] = calculate_average_metric(metric_dict)
+
+        if gate_values is not None:
+            self.last_gate_statistics = self.summarize_gate_values(gate_values)
 
         return metric_dict

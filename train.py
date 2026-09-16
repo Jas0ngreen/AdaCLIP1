@@ -114,6 +114,7 @@ def train(args):
                 test_data_cls_names,
                 save_fig_flag,
                 image_dir,
+                collect_gate_stats=args.log_gate_stats,
             )
 
             log_metrics(
@@ -122,6 +123,46 @@ def train(args):
                 tensorboard_logger,
                 epoch
             )
+
+            if args.log_gate_stats:
+                gate_statistics = getattr(
+                    model,
+                    'last_gate_statistics',
+                    {},
+                )
+
+                if not gate_statistics:
+                    logger.info(
+                        'Gate statistics are unavailable for the current configuration.'
+                    )
+
+                for branch, layer_statistics in gate_statistics.items():
+                    for layer, statistics in enumerate(layer_statistics):
+                        inactive_label = (
+                            ' [inactive]'
+                            if branch == 'text' and layer == 0
+                            else ''
+                        )
+
+                        logger.info(
+                            f'Gate branch={branch} '
+                            f'layer={layer}{inactive_label} '
+                            f'mean={statistics["mean"]:.6f} '
+                            f'std={statistics["std"]:.6f} '
+                            f'min={statistics["min"]:.6f} '
+                            f'max={statistics["max"]:.6f} '
+                            f'p01={statistics["p01"]:.6f} '
+                            f'p99={statistics["p99"]:.6f} '
+                            f'near0={statistics["near0"]:.4f} '
+                            f'near2={statistics["near2"]:.4f}'
+                        )
+
+                        for statistic_name, statistic_value in statistics.items():
+                            tensorboard_logger.add_scalar(
+                                f'gate/{branch}/layer_{layer}/{statistic_name}',
+                                statistic_value,
+                                epoch,
+                            )
 
             f1_px = metric_dict['Average']['f1_px']
 
@@ -202,6 +243,13 @@ if __name__ == '__main__':
         type=float,
         default=0.001,
         help="Learning rate for layer-wise Gate modules"
+    )
+
+    parser.add_argument(
+        "--log_gate_stats",
+        type=str2bool,
+        default=False,
+        help="Log per-layer Gate statistics after each validation (default: False)"
     )
 
     parser.add_argument(
