@@ -117,6 +117,7 @@ class PromptLayer(nn.Module):
             if self.fusion_mode in (
                     "layer_gate",
                     "residual_layer_gate",
+                    "shared_gate",
             ):
                 if self.dynamic_gates is None:
                     raise RuntimeError(
@@ -433,6 +434,21 @@ class LayerWisePromptGate(nn.Module):
         return gates
 
 
+class SharedPromptGate(nn.Module):
+    """One image-conditioned gate shared by every prompted layer and branch."""
+
+    def __init__(self, input_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(input_dim)
+        self.proj = nn.Linear(input_dim, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, image_features):
+        logits = self.proj(self.norm(image_features.float()))
+        return logits, torch.sigmoid(logits)
+
+
 class AdaCLIP(nn.Module):
     def __init__(self, freeze_clip: CLIP, text_channel: int, visual_channel: int,
                  prompting_length: int, prompting_depth: int, prompting_branch: str, prompting_type: str,
@@ -441,15 +457,14 @@ class AdaCLIP(nn.Module):
                  fusion_mode: str = "add"):
         super(AdaCLIP, self).__init__()
 
-        if fusion_mode not in ("add", "layer_gate"):
+        if fusion_mode not in ("add", "layer_gate", "shared_gate"):
             raise ValueError(
-                f"当前仅支持 add 和 layer_gate，收到：{fusion_mode}"
+                f"当前仅支持 add、layer_gate 和 shared_gate，收到：{fusion_mode}"
             )
 
-        # TODO 这里少一个residual_layer_gate还没有实现
-        if fusion_mode == "layer_gate" and prompting_type != "SD":
+        if fusion_mode in ("layer_gate", "shared_gate") and prompting_type != "SD":
             raise ValueError(
-                "layer_gate 需要 prompting_type='SD'，"
+                f"{fusion_mode} 需要 prompting_type='SD'，"
                 "因为它用于融合静态和动态 Prompt。"
             )
 
@@ -546,6 +561,10 @@ class AdaCLIP(nn.Module):
         # 未启用Gate时的安全值，无论是否启用 Gate，这两个属性都存在。
         self.visual_gate_generator: Optional[LayerWisePromptGate] = None
         self.text_gate_generator: Optional[LayerWisePromptGate] = None
+        self.shared_gate_generator: Optional[SharedPromptGate] = None
+        self.shared_gate_logits = None
+        self.shared_gate_weights = None
+        self.condition_features = None
 
         if self.fusion_mode in ("layer_gate", "residual_layer_gate"):
             if self.enable_visual_prompt:
@@ -560,12 +579,34 @@ class AdaCLIP(nn.Module):
                     prompting_depth=prompting_depth,
                 )
 
-    def generate_and_set_dynamic_prompts(self, image):
+        if self.fusion_mode == "shared_gate":
+            self.shared_gate_generator = SharedPromptGate(text_channel)
+
+    def generate_and_set_dynamic_prompts(self, image, gate_override=None):
         with torch.no_grad():
             image_features, _ = self.visual.forward(
                 image,
                 self.output_layers,
             )
+        self.condition_features = image_features
+
+        shared_gates = None
+        if self.shared_gate_generator is not None:
+            if gate_override is None:
+                self.shared_gate_logits, weights = self.shared_gate_generator(
+                    image_features
+                )
+            else:
+                if not 0.0 <= gate_override <= 1.0:
+                    raise ValueError("gate_override must be between 0 and 1")
+                self.shared_gate_logits = None
+                weights = image_features.new_full(
+                    (image_features.shape[0], 1), gate_override
+                )
+            self.shared_gate_weights = weights
+            shared_gates = weights.expand(-1, self.prompting_depth)
+        elif gate_override is not None:
+            raise ValueError("gate_override requires fusion_mode='shared_gate'")
 
         if self.enable_visual_prompt:
             dynamic_visual_prompts = (
@@ -573,7 +614,9 @@ class AdaCLIP(nn.Module):
             )
 
             visual_gates = None
-            if self.visual_gate_generator is not None:
+            if shared_gates is not None:
+                visual_gates = shared_gates
+            elif self.visual_gate_generator is not None:
                 visual_gates = self.visual_gate_generator(image_features)
 
             self.visual_prompter.set_dynamic_prompts(
@@ -589,7 +632,9 @@ class AdaCLIP(nn.Module):
             )
 
             text_gates = None
-            if self.text_gate_generator is not None:
+            if shared_gates is not None:
+                text_gates = shared_gates
+            elif self.text_gate_generator is not None:
                 text_gates = self.text_gate_generator(
                     image_features
                 )
@@ -732,9 +777,9 @@ class AdaCLIP(nn.Module):
                 anomaly_maps[i] = torch.softmax(anomaly_maps[i], dim=1)
             return anomaly_maps, anomaly_score
 
-    def extract_feat(self, image, cls_name):
+    def extract_feat(self, image, cls_name, gate_override=None):
         if "D" in self.prompting_type and not self.static_only:
-            self.generate_and_set_dynamic_prompts(image)  # generate and set dynamic prompts for corresponding prompters
+            self.generate_and_set_dynamic_prompts(image, gate_override=gate_override)
 
         if self.enable_visual_prompt:
             image_features, patch_tokens, _ = self.encode_image(image)
@@ -753,9 +798,11 @@ class AdaCLIP(nn.Module):
         return proj_cls_tokens, proj_patch_tokens, text_features
 
     @torch.cuda.amp.autocast()
-    def forward(self, image, cls_name, aggregation=True):
+    def forward(self, image, cls_name, aggregation=True, gate_override=None):
         # extract features for images and texts
-        image_features, patch_tokens, text_features = self.extract_feat(image, cls_name)
+        image_features, patch_tokens, text_features = self.extract_feat(
+            image, cls_name, gate_override=gate_override
+        )
         anomaly_map, anomaly_score = self.visual_text_similarity(image_features, patch_tokens, text_features,
                                                                  aggregation)
 

@@ -56,8 +56,15 @@ def setup_paths(args):
     if args.fusion_mode == 'residual_layer_gate':
         model_name += f'-M{args.prompt_ema_momentum:g}'
 
-    if args.fusion_mode in ('layer_gate', 'residual_layer_gate'):
+    if args.fusion_mode in ('layer_gate', 'residual_layer_gate', 'shared_gate'):
         model_name += f'-GLR{args.gate_learning_rate:g}'
+
+    if args.fusion_mode == 'shared_gate':
+        model_name += (
+            f'-GE{args.gate_epochs}'
+            f'-GT{args.gate_utility_temperature:g}'
+            f'-GW{args.gate_task_weight:g}'
+        )
 
     # prepare model path
     ckp_path = os.path.join(model_root, model_name)

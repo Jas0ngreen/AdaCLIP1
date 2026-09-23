@@ -62,10 +62,14 @@ def train(args):
         prompting_branch=args.prompting_branch,
         prompting_type=args.prompting_type,
         use_hsf=args.use_hsf,
-        k_clusters=args.k_clusters
+        k_clusters=args.k_clusters,
+        fusion_mode=args.fusion_mode,
     ).to(device)
 
     model.load(args.ckt_path)
+    if args.gate_override is not None:
+        if args.fusion_mode != "shared_gate" or not 0 <= args.gate_override <= 1:
+            raise ValueError("--gate_override requires shared_gate and a value in [0, 1]")
 
     if args.testing_model == 'dataset':
         assert args.testing_data in dataset_dict.keys(), f"You entered {args.testing_data}, but we only support " \
@@ -74,8 +78,15 @@ def train(args):
         save_root = args.save_path
         csv_root = os.path.join(save_root, 'csvs')
         image_root = os.path.join(save_root, 'images')
-        csv_path = os.path.join(csv_root, f'{args.testing_data}.csv')
-        image_dir = os.path.join(image_root, f'{args.testing_data}')
+        suffix = ''
+        if args.fusion_mode == "shared_gate":
+            gate_label = (
+                "learned" if args.gate_override is None
+                else f"fixed_{args.gate_override:g}"
+            )
+            suffix = f'_shared_gate_{gate_label}'
+        csv_path = os.path.join(csv_root, f'{args.testing_data}{suffix}.csv')
+        image_dir = os.path.join(image_root, f'{args.testing_data}{suffix}')
         os.makedirs(image_dir, exist_ok=True)
         os.makedirs(csv_root, exist_ok=True) # 新创建csv文件
 
@@ -93,6 +104,7 @@ def train(args):
             test_data_cls_names,
             save_fig_flag,
             image_dir,
+            gate_override=args.gate_override,
         )
 
         for tag, data in metric_dict.items():
@@ -120,7 +132,10 @@ def train(args):
         img_input = img_input.to(model.device)
 
         with torch.no_grad():
-            anomaly_map, anomaly_score = model.clip_model(img_input, [args.class_name], aggregation=True)
+            anomaly_map, anomaly_score = model.clip_model(
+                img_input, [args.class_name], aggregation=True,
+                gate_override=args.gate_override,
+            )
 
         anomaly_map = anomaly_map[0, :, :]
         anomaly_score = anomaly_score[0]
@@ -189,6 +204,15 @@ if __name__ == '__main__':
     parser.add_argument("--use_hsf", type=str2bool, default=True,
                         help="Use HSF for aggregation. If False, original class embedding is used (default: True)")
     parser.add_argument("--k_clusters", type=int, default=20, help="Number of clusters (default: 20)")
+    parser.add_argument(
+        "--fusion_mode", type=str, default="add",
+        choices=["add", "layer_gate", "shared_gate"],
+        help="Prompt fusion mode used by the checkpoint",
+    )
+    parser.add_argument(
+        "--gate_override", type=float, default=None,
+        help="For shared_gate, use a fixed weight in [0, 1] instead of the learned gate",
+    )
 
     args = parser.parse_args()
 
@@ -197,4 +221,3 @@ if __name__ == '__main__':
             "Currently, only batch size of 1 is supported due to unresolved bugs. Please set --batch_size to 1.")
 
     train(args)
-

@@ -1,4 +1,6 @@
 import cv2
+import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 from scipy.ndimage import gaussian_filter
 
@@ -84,6 +86,7 @@ class AdaCLIP_Trainer(nn.Module):
         self.gate_parameter_names = [
             "visual_gate_generator",
             "text_gate_generator",
+            "shared_gate_generator",
         ]
 
         self.learnable_paramter_list = (
@@ -137,26 +140,36 @@ class AdaCLIP_Trainer(nn.Module):
         torch.save(self.save_dict, path)
 
     def load(self, path):
-        self.load_state_dict(torch.load(path, map_location=self.device), strict=False)
+        state_dict = torch.load(path, map_location=self.device)
+        has_shared_gate = any(
+            "shared_gate_generator" in name for name in state_dict
+        )
+        if has_shared_gate and self.fusion_mode != "shared_gate":
+            raise ValueError(
+                "This checkpoint uses shared_gate; pass --fusion_mode shared_gate"
+            )
+        incompatible = self.load_state_dict(state_dict, strict=False)
+        if self.fusion_mode == "shared_gate":
+            missing_gate = [
+                name for name in incompatible.missing_keys
+                if "shared_gate_generator" in name
+            ]
+            if missing_gate:
+                raise ValueError(
+                    f"Checkpoint {path} is missing shared gate weights: {missing_gate}"
+                )
 
-    def train_one_batch(self, items):
-        image = items['img'].to(self.device)
-        cls_name = items['cls_name']
-
-        # pixel level
-        anomaly_map, anomaly_score = self.clip_model(image, cls_name, aggregation=False)
-
+    def detection_loss(self, anomaly_map, anomaly_score, items):
         if not isinstance(anomaly_map, list):
             anomaly_map = [anomaly_map]
 
-        # losses
         gt = items['img_mask'].to(self.device)
         gt = gt.squeeze()
 
         gt[gt > 0.5] = 1
         gt[gt <= 0.5] = 0
 
-        is_anomaly = items['anomaly'].to(self.device)
+        is_anomaly = items['anomaly'].to(self.device).float()
         is_anomaly[is_anomaly > 0.5] = 1
         is_anomaly[is_anomaly <= 0.5] = 0
         loss = 0
@@ -172,6 +185,15 @@ class AdaCLIP_Trainer(nn.Module):
                          self.loss_dice(am[:, 0, :, :], 1-gt))
 
         loss += seg_loss
+        return loss
+
+    def train_one_batch(self, items, gate_override=None):
+        image = items['img'].to(self.device)
+        cls_name = items['cls_name']
+        anomaly_map, anomaly_score = self.clip_model(
+            image, cls_name, aggregation=False, gate_override=gate_override
+        )
+        loss = self.detection_loss(anomaly_map, anomaly_score, items)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -179,11 +201,76 @@ class AdaCLIP_Trainer(nn.Module):
 
         return loss
 
-    def train_epoch(self, loader):
-        self.clip_model.train()
+    def prepare_shared_gate_training(self):
+        if self.fusion_mode != "shared_gate":
+            raise ValueError("Gate utility training requires fusion_mode='shared_gate'")
+        for parameter in self.clip_model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.clip_model.shared_gate_generator.parameters():
+            parameter.requires_grad_(True)
+
+    def train_shared_gate_batch(self, items, utility_temperature, task_weight):
+        image = items['img'].to(self.device)
+        if image.shape[0] != 1:
+            raise ValueError("Shared gate utility training currently requires batch size 1")
+        cls_name = items['cls_name']
+
+        with torch.no_grad():
+            static_map, static_score = self.clip_model(
+                image, cls_name, aggregation=False, gate_override=0.0
+            )
+            static_loss = self.detection_loss(static_map, static_score, items)
+            dynamic_map, dynamic_score = self.clip_model(
+                image, cls_name, aggregation=False, gate_override=1.0
+            )
+            dynamic_loss = self.detection_loss(dynamic_map, dynamic_score, items)
+            utility_target = torch.sigmoid(
+                (static_loss - dynamic_loss) / utility_temperature
+            )
+
+        gated_map = gated_score = None
+        if task_weight > 0:
+            gated_map, gated_score = self.clip_model(
+                image, cls_name, aggregation=False
+            )
+            gate_logits = self.clip_model.shared_gate_logits
+        else:
+            gate_logits, _ = self.clip_model.shared_gate_generator(
+                self.clip_model.condition_features
+            )
+        utility_loss = F.binary_cross_entropy_with_logits(
+            gate_logits.reshape(-1), utility_target.reshape(-1)
+        )
+        loss = utility_loss
+        if task_weight > 0:
+            loss = loss + task_weight * self.detection_loss(
+                gated_map, gated_score, items
+            )
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss
+
+    def train_epoch(self, loader, stage="standard", utility_temperature=1.0,
+                    task_weight=1.0):
+        if stage == "gate":
+            self.clip_model.eval()
+        else:
+            self.clip_model.train()
         loss_list = []
         for items in loader:
-            loss = self.train_one_batch(items)
+            if stage == "dual":
+                gate_override = float(torch.randint(0, 2, ()).item())
+                loss = self.train_one_batch(items, gate_override=gate_override)
+            elif stage == "gate":
+                loss = self.train_shared_gate_batch(
+                    items, utility_temperature, task_weight
+                )
+            elif stage == "standard":
+                loss = self.train_one_batch(items)
+            else:
+                raise ValueError(f"Unknown training stage: {stage}")
             loss_list.append(loss.item())
 
         return np.mean(loss_list)
@@ -219,16 +306,17 @@ class AdaCLIP_Trainer(nn.Module):
         return gate_statistics
 
     @torch.no_grad()
-    def evaluation(self, dataloader, obj_list, save_fig, save_fig_dir=None, collect_gate_stats=False):
+    def evaluation(self, dataloader, obj_list, save_fig, save_fig_dir=None,
+                   collect_gate_stats=False, gate_override=None):
         self.clip_model.eval()
 
         self.last_gate_statistics = {}
         gate_values = None
         if collect_gate_stats:
-            gate_values = {
-                'visual': [],
-                'text': [],
-            }
+            if self.fusion_mode == "shared_gate":
+                gate_values = {'shared': []}
+            else:
+                gate_values = {'visual': [], 'text': []}
 
         results = {}
         results['cls_names'] = []
@@ -262,21 +350,29 @@ class AdaCLIP_Trainer(nn.Module):
                     results['imgs_masks'].append(_gt_mask.squeeze(0).numpy())  # px
 
                 # pixel level
-                anomaly_map, anomaly_score = self.clip_model(image, cls_name, aggregation=True)
+                anomaly_map, anomaly_score = self.clip_model(
+                    image, cls_name, aggregation=True,
+                    gate_override=gate_override,
+                )
 
                 if gate_values is not None:
-                    visual_gates = self.clip_model.visual_prompter.dynamic_gates
-                    text_gates = self.clip_model.text_prompter.dynamic_gates
-
-                    if visual_gates is not None:
-                        gate_values['visual'].append(
-                            visual_gates.detach().float().cpu()
+                    if self.fusion_mode == "shared_gate":
+                        gate_values['shared'].append(
+                            self.clip_model.shared_gate_weights.detach().float().cpu()
                         )
+                    else:
+                        visual_gates = self.clip_model.visual_prompter.dynamic_gates
+                        text_gates = self.clip_model.text_prompter.dynamic_gates
 
-                    if text_gates is not None:
-                        gate_values['text'].append(
-                            text_gates.detach().float().cpu()
-                        )
+                        if visual_gates is not None:
+                            gate_values['visual'].append(
+                                visual_gates.detach().float().cpu()
+                            )
+
+                        if text_gates is not None:
+                            gate_values['text'].append(
+                                text_gates.detach().float().cpu()
+                            )
 
                 anomaly_map = anomaly_map.cpu().numpy()
                 anomaly_score = anomaly_score.cpu().numpy()

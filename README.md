@@ -115,6 +115,33 @@ Since we have utilized half-precision (FP16) for training, the training process 
 It is recommended to run the training process multiple times and choose the best model based on performance
 on the validation set as the final model.
 
+### Shared gate experiment
+
+`shared_gate` predicts one weight per image and applies it to every visual and text prompt layer.
+The first `--epoch` epochs alternate between static-only (`r=0`) and full dynamic (`r=1`)
+prompts on the auxiliary training data. The next `--gate_epochs` epochs freeze those
+prompts and train the gate against the difference in their detection losses.
+`--gate_task_weight` optionally adds the gated detection loss during the second stage.
+The target dataset is evaluated once after both stages and does not select the checkpoint.
+
+```bash
+python train.py --fusion_mode shared_gate --training_data mvtec colondb \
+  --testing_data visa --epoch 5 --gate_epochs 3 \
+  --gate_utility_temperature 1.0 --gate_task_weight 0
+```
+
+Training writes a `_base.pth` checkpoint after the first stage and a `_final.pth`
+checkpoint after gate training. Pass the final checkpoint and the same prompt settings
+to `test.py`. For fixed-weight controls, run the same checkpoint with
+`--gate_override 0`, `--gate_override 0.5`, and `--gate_override 1`:
+
+```bash
+python test.py --fusion_mode shared_gate --ckt_path /path/to/checkpoint_final.pth \
+  --testing_data visa --gate_override 0.5
+```
+
+The current training and testing scripts require `--batch_size 1`.
+
 
 To construct a robust ZSAD model for demonstration, we also train our AdaCLIP on all AD datasets mentioned above:
 ```shell

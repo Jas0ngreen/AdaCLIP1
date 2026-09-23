@@ -86,6 +86,55 @@ def train(args):
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False)
 
+    if args.fusion_mode == "shared_gate":
+        if epochs <= 0 or args.gate_epochs <= 0:
+            raise ValueError("--epoch and --gate_epochs must be positive")
+        if args.gate_utility_temperature <= 0:
+            raise ValueError("--gate_utility_temperature must be positive")
+        if args.gate_task_weight < 0:
+            raise ValueError("--gate_task_weight must be nonnegative")
+
+        # Train both reference paths on the auxiliary data. The gate is bypassed.
+        for epoch in tqdm(range(epochs), desc="dual-path training"):
+            loss = model.train_epoch(train_dataloader, stage="dual")
+            logger.info(f'dual epoch [{epoch + 1}/{epochs}], loss:{loss:.4f}')
+            tensorboard_logger.add_scalar('dual/loss', loss, epoch)
+        model.save(ckp_path + '_base.pth')
+
+        model.prepare_shared_gate_training()
+        for epoch in tqdm(range(args.gate_epochs), desc="shared-gate training"):
+            loss = model.train_epoch(
+                train_dataloader,
+                stage="gate",
+                utility_temperature=args.gate_utility_temperature,
+                task_weight=args.gate_task_weight,
+            )
+            logger.info(
+                f'gate epoch [{epoch + 1}/{args.gate_epochs}], loss:{loss:.4f}'
+            )
+            tensorboard_logger.add_scalar('gate/loss', loss, epoch)
+
+        # The target dataset is evaluated only after training; it never selects a checkpoint.
+        final_path = ckp_path + '_final.pth'
+        model.save(final_path)
+        logger.info(f'Final shared-gate checkpoint: {final_path}')
+        metric_dict = model.evaluation(
+            test_dataloader,
+            test_data_cls_names,
+            save_fig,
+            image_dir,
+            collect_gate_stats=args.log_gate_stats,
+        )
+        log_metrics(metric_dict, logger, tensorboard_logger, epochs + args.gate_epochs)
+        for key, values in metric_dict.items():
+            write2csv(values, test_data_cls_names, key, csv_path)
+        if args.log_gate_stats:
+            for branch, layers in model.last_gate_statistics.items():
+                for layer, statistics in enumerate(layers):
+                    logger.info(f'Gate branch={branch} layer={layer} {statistics}')
+        tensorboard_logger.close()
+        return
+
     # Typically, we use MVTec or VisA as the validation set. The best model from this validation
     # process is then used for zero-shot anomaly detection on novel categories.
     best_f1 = -1e1
@@ -234,7 +283,7 @@ if __name__ == '__main__':
         "--fusion_mode",
         type=str,
         default="add",
-        choices=["add", "layer_gate", "residual_layer_gate"],
+        choices=["add", "layer_gate", "residual_layer_gate", "shared_gate"],
         help="Static and dynamic prompt fusion method"
     )
 
@@ -243,6 +292,19 @@ if __name__ == '__main__':
         type=float,
         default=0.001,
         help="Learning rate for layer-wise Gate modules"
+    )
+
+    parser.add_argument(
+        "--gate_epochs", type=int, default=3,
+        help="Gate-only epochs after dual-path training (shared_gate only)",
+    )
+    parser.add_argument(
+        "--gate_utility_temperature", type=float, default=1.0,
+        help="Temperature for static-vs-dynamic loss targets (shared_gate only)",
+    )
+    parser.add_argument(
+        "--gate_task_weight", type=float, default=0.0,
+        help="Optional gated detection-loss weight in gate-only training",
     )
 
     parser.add_argument(
