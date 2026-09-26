@@ -117,6 +117,60 @@ on the validation set as the final model.
 
 ### Shared gate experiment
 
+#### Restart gate training after the freeze fix
+
+Stage two clears all residual gradients and creates a fresh AdamW optimizer with
+only the shared gate parameters. Gate updates explicitly use
+`zero_grad(set_to_none=True)`, including on PyTorch 1.10. Baseline training is unchanged.
+After each gate epoch, the run verifies that all saved non-gate detector tensors
+are exactly unchanged. The frozen CLIP backbone is not copied for this comparison;
+instead, all non-gate parameters are checked for disabled gradients, absent gradient
+tensors, and exclusion from the optimizer. A failed check aborts before final saving.
+
+To reuse the existing stage-one checkpoint, run from the repository root on the
+training server after syncing the updated code:
+
+```bash
+python train.py --fusion_mode shared_gate \
+  --resume_gate_from ./workspaces/shared_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fshared_gate-W0-S111-GLR0.001-GE3-GT1-GW0_base.pth \
+  --training_data mvtec colondb --testing_data visa \
+  --epoch 5 --gate_epochs 3 --gate_learning_rate 0.001 \
+  --gate_utility_temperature 1.0 --gate_task_weight 0 \
+  --log_gate_stats True --seed 111 --batch_size 1 \
+  --save_path ./workspaces/shared_111_fixed
+```
+
+`--resume_gate_from` skips all five dual-path epochs; only the three gate epochs
+run. Use the original `*_base.pth`, not the corrupted `*_final.pth`, and matching
+backbone/prompt configuration. A filename alone cannot verify checkpoint provenance.
+The output directory must be new or empty and must not contain the source checkpoint.
+The new run saves its own `_base.pth` copy and `_final.pth`; the original run is preserved.
+Optimizer/RNG state was not saved in the original checkpoint, so this restarts gate
+training with the specified seed rather than reproducing an uninterrupted run exactly.
+
+Expect `Freeze check PASS` after each gate epoch. Training evaluates the learned
+gate on VisA at the end. The following evaluations are **separate commands** and
+do not retrain the model:
+
+```bash
+checkpoint_path="./workspaces/shared_111_fixed/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fshared_gate-W0-S111-GLR0.001-GE3-GT1-GW0_final.pth"
+python test.py --fusion_mode shared_gate --ckt_path "$checkpoint_path" \
+  --testing_data visa --save_path ./workspaces/shared_111_fixed
+for gate_weight in 0 0.5 1; do
+  python test.py --fusion_mode shared_gate --ckt_path "$checkpoint_path" \
+    --testing_data visa --gate_override "$gate_weight" \
+    --save_path ./workspaces/shared_111_fixed
+done
+```
+
+CPU regression checks (PyTorch required; no CLIP weights or datasets needed):
+
+```bash
+python -m unittest discover -s tests -p 'test_shared_gate_freeze.py' -v
+```
+
+#### Training from scratch
+
 `shared_gate` predicts one weight per image and applies it to every visual and text prompt layer.
 The first `--epoch` epochs alternate between static-only (`r=0`) and full dynamic (`r=1`)
 prompts on the auxiliary training data. The next `--gate_epochs` epochs freeze those

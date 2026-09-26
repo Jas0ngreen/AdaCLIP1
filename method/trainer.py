@@ -139,8 +139,26 @@ class AdaCLIP_Trainer(nn.Module):
 
         torch.save(self.save_dict, path)
 
-    def load(self, path):
+    def load(self, path, require_complete=False):
         state_dict = torch.load(path, map_location=self.device)
+        if require_complete:
+            # Saved checkpoints omit the frozen CLIP backbone, but must contain
+            # every trained detector/gate tensor when restarting stage two.
+            expected = {
+                name for name in self.state_dict()
+                if any(part in name for part in self.learnable_paramter_list)
+            }
+            missing = expected - set(state_dict)
+            unexpected = set(state_dict) - expected
+            if missing or unexpected:
+                raise ValueError(
+                    f"Incomplete/incompatible stage-one checkpoint: "
+                    f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+                )
+            invalid = [name for name, value in state_dict.items()
+                       if not torch.isfinite(value).all()]
+            if invalid:
+                raise ValueError(f"Non-finite checkpoint tensors: {invalid}")
         has_shared_gate = any(
             "shared_gate_generator" in name for name in state_dict
         )
@@ -206,8 +224,47 @@ class AdaCLIP_Trainer(nn.Module):
             raise ValueError("Gate utility training requires fusion_mode='shared_gate'")
         for parameter in self.clip_model.parameters():
             parameter.requires_grad_(False)
-        for parameter in self.clip_model.shared_gate_generator.parameters():
+            # requires_grad=False does not clear gradients from stage one.
+            parameter.grad = None
+        gate_parameters = list(self.clip_model.shared_gate_generator.parameters())
+        for parameter in gate_parameters:
             parameter.requires_grad_(True)
+        self.params_to_update = gate_parameters
+        # Do not retain the base parameters or their Adam momentum/weight decay.
+        self.optimizer = torch.optim.AdamW(
+            gate_parameters, lr=self.gate_learning_rate,
+            betas=(0.5, 0.999), weight_decay=0.0,
+        )
+        # Match the non-gate tensors included by save(). The large frozen CLIP
+        # backbone is excluded; its requires_grad/optimizer membership is checked
+        # separately below, without a second full backbone copy in CPU memory.
+        self._shared_gate_frozen_state = {
+            name: value.detach().cpu().clone()
+            for name, value in self.state_dict().items()
+            if "shared_gate_generator" not in name
+            and any(part in name for part in self.learnable_paramter_list)
+        }
+        self.assert_shared_gate_frozen()
+
+    def assert_shared_gate_frozen(self):
+        """Fail before saving if stage two changes the saved detector tensors."""
+        if not hasattr(self, "_shared_gate_frozen_state"):
+            raise RuntimeError("Call prepare_shared_gate_training() before gate training")
+        gate_ids = {id(p) for p in self.clip_model.shared_gate_generator.parameters()}
+        optimized_ids = {id(p) for group in self.optimizer.param_groups
+                         for p in group["params"]}
+        if optimized_ids != gate_ids:
+            raise RuntimeError("Stage-two optimizer must contain only shared gate parameters")
+        invalid = [name for name, p in self.clip_model.named_parameters()
+                   if id(p) not in gate_ids and (p.requires_grad or p.grad is not None)]
+        if invalid:
+            raise RuntimeError(f"Non-gate parameters not fully frozen: {invalid}")
+        current = self.state_dict()
+        changed = [name for name, before in self._shared_gate_frozen_state.items()
+                   if not torch.equal(before, current[name].detach().cpu())]
+        if changed:
+            raise RuntimeError(f"Non-gate checkpoint tensors changed during stage two: {changed}")
+        return len(self._shared_gate_frozen_state)
 
     def train_shared_gate_batch(self, items, utility_temperature, task_weight):
         image = items['img'].to(self.device)
@@ -247,7 +304,7 @@ class AdaCLIP_Trainer(nn.Module):
                 gated_map, gated_score, items
             )
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
         return loss
@@ -255,6 +312,7 @@ class AdaCLIP_Trainer(nn.Module):
     def train_epoch(self, loader, stage="standard", utility_temperature=1.0,
                     task_weight=1.0):
         if stage == "gate":
+            self.assert_shared_gate_frozen()
             self.clip_model.eval()
         else:
             self.clip_model.train()

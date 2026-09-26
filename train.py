@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import torch
+from pathlib import Path
 
 # Importing from local modules
 from tools import write2csv, setup_paths, setup_seed, log_metrics, Logger
@@ -17,7 +18,34 @@ from method import AdaCLIP_Trainer
 # TODO 最后代码完成删掉
 #setup_seed(111)
 
+def validate_gate_resume(args):
+    """Validate before setup_paths can create/replace any run artifacts."""
+    if not args.resume_gate_from:
+        return
+    if args.fusion_mode != "shared_gate":
+        raise ValueError("--resume_gate_from requires --fusion_mode shared_gate")
+    source = Path(args.resume_gate_from).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Stage-one checkpoint not found: {source}")
+    if not source.name.endswith("_base.pth"):
+        raise ValueError("--resume_gate_from must point to the stage-one *_base.pth, not *_final.pth")
+    destination = Path(args.save_path).expanduser().resolve()
+    if destination in source.parents:
+        raise ValueError("Use a new --save_path outside the source checkpoint directory")
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise ValueError("Gate restart requires a new or empty --save_path to preserve existing results")
+    args.resume_gate_from = str(source)
+
+
 def train(args):
+    validate_gate_resume(args)
+    if args.fusion_mode == "shared_gate":
+        if (not args.resume_gate_from and args.epoch <= 0) or args.gate_epochs <= 0:
+            raise ValueError("--epoch (unless restarting gates) and --gate_epochs must be positive")
+        if args.gate_utility_temperature <= 0:
+            raise ValueError("--gate_utility_temperature must be positive")
+        if args.gate_task_weight < 0:
+            raise ValueError("--gate_task_weight must be nonnegative")
     setup_seed(args.seed)
 
     # Configurations
@@ -69,6 +97,11 @@ def train(args):
         gate_learning_rate=args.gate_learning_rate,
     ).to(device)
 
+    if args.resume_gate_from:
+        model.load(args.resume_gate_from, require_complete=True)
+        logger.info(f'Restarting gate training from: {args.resume_gate_from}')
+        logger.info('Skipping dual-path training; optimizer and RNG restart fresh (not exact continuation).')
+
     train_data_cls_names, train_data, train_data_root = get_data(
         dataset_type_list=args.training_data,
         transform=model.preprocess,
@@ -87,18 +120,14 @@ def train(args):
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False)
 
     if args.fusion_mode == "shared_gate":
-        if epochs <= 0 or args.gate_epochs <= 0:
-            raise ValueError("--epoch and --gate_epochs must be positive")
-        if args.gate_utility_temperature <= 0:
-            raise ValueError("--gate_utility_temperature must be positive")
-        if args.gate_task_weight < 0:
-            raise ValueError("--gate_task_weight must be nonnegative")
-
         # Train both reference paths on the auxiliary data. The gate is bypassed.
-        for epoch in tqdm(range(epochs), desc="dual-path training"):
-            loss = model.train_epoch(train_dataloader, stage="dual")
-            logger.info(f'dual epoch [{epoch + 1}/{epochs}], loss:{loss:.4f}')
-            tensorboard_logger.add_scalar('dual/loss', loss, epoch)
+        if not args.resume_gate_from:
+            for epoch in tqdm(range(epochs), desc="dual-path training"):
+                loss = model.train_epoch(train_dataloader, stage="dual")
+                logger.info(f'dual epoch [{epoch + 1}/{epochs}], loss:{loss:.4f}')
+                tensorboard_logger.add_scalar('dual/loss', loss, epoch)
+        # In restart mode this saves a copy of the loaded starting weights in
+        # the new run directory so base/final comparison remains self-contained.
         model.save(ckp_path + '_base.pth')
 
         model.prepare_shared_gate_training()
@@ -108,6 +137,11 @@ def train(args):
                 stage="gate",
                 utility_temperature=args.gate_utility_temperature,
                 task_weight=args.gate_task_weight,
+            )
+            frozen_count = model.assert_shared_gate_frozen()
+            logger.info(
+                f'Freeze check PASS: {frozen_count} non-gate checkpoint tensors unchanged; '
+                'only shared gate parameters are in the optimizer.'
             )
             logger.info(
                 f'gate epoch [{epoch + 1}/{args.gate_epochs}], loss:{loss:.4f}'
@@ -294,6 +328,10 @@ if __name__ == '__main__':
         help="Learning rate for layer-wise Gate modules"
     )
 
+    parser.add_argument(
+        "--resume_gate_from", type=str, default="",
+        help="Restart only shared-gate training from a stage-one *_base.pth; use a new --save_path",
+    )
     parser.add_argument(
         "--gate_epochs", type=int, default=3,
         help="Gate-only epochs after dual-path training (shared_gate only)",
