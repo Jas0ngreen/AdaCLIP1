@@ -117,6 +117,39 @@ on the validation set as the final model.
 
 ### Shared gate experiment
 
+#### Baseline-preserving equivalence check (no training)
+
+Use the original `add` checkpoint, not a dual-path/shared-gate checkpoint.
+Explicit `--load_baseline` validates and exactly copies all saved detector tensors,
+rejects missing/extra/non-finite or incompatible tensors, and initializes a new,
+untrained shared gate. Normal checkpoint loading remains strict about missing gates.
+
+```bash
+python test.py --fusion_mode shared_gate --load_baseline --check_gate_equivalence \
+  --ckt_path ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --testing_data visa --save_path ./workspaces/baseline_111_gate_check
+```
+
+This selects the first normal and anomalous image available in each class
+(`--equivalence_per_group` controls the count per class/label group). It compares
+the actual `add` and `shared_gate=1` forward paths using the **same parameters and
+backbone**, temporarily bypassing the gate generator for the add pass. No second
+CLIP copy is allocated on the GPU. Python/NumPy/Torch/CUDA random states are paired
+for the two passes, including HSF clustering, and restored afterward. It reports
+maximum absolute differences in raw anomaly maps and image scores, checks finite
+outputs with `atol=1e-6, rtol=1e-5`, and fails on mismatch. It does not train, save
+checkpoints, select a gate using labels, or compute full-dataset metrics. Labels
+are used only for representative normal/anomalous coverage. A subset PASS is an
+implementation smoke test, not proof for every dataset image.
+
+Send the `Baseline import PASS` and `Equivalence summary` lines from
+`workspaces/baseline_111_gate_check/logs/visa_baseline_shared_gate_equivalence.txt`.
+Do not start gate training until this check passes. For later full-dataset fixed
+gate evaluation, omit `--check_gate_equivalence` and explicitly set
+`--gate_override`; results receive a distinct `baseline_shared_gate` filename.
+An imported baseline must not be evaluated as a learned gate because that gate
+has not been trained.
+
 #### Restart gate training after the freeze fix
 
 Stage two clears all residual gradients and creates a fresh AdamW optimizer with

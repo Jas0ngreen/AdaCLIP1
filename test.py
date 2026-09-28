@@ -22,6 +22,18 @@ setup_seed(111)
 
 def train(args):
     assert os.path.isfile(args.ckt_path), f"Please check the path of pre-trained model, {args.ckt_path} is not valid."
+    if args.load_baseline:
+        if args.fusion_mode != "shared_gate":
+            raise ValueError("--load_baseline requires --fusion_mode shared_gate")
+        if not args.check_gate_equivalence and args.gate_override is None:
+            raise ValueError("An imported baseline has no learned gate; specify --gate_override")
+    if args.check_gate_equivalence:
+        if not args.load_baseline or args.testing_model != "dataset":
+            raise ValueError("--check_gate_equivalence requires --load_baseline and dataset testing")
+        if args.gate_override not in (None, 1.0):
+            raise ValueError("Equivalence checking compares add with gate=1 only")
+        if args.equivalence_per_group < 1:
+            raise ValueError("--equivalence_per_group must be positive")
 
     # Configurations
     batch_size = args.batch_size
@@ -31,7 +43,12 @@ def train(args):
     save_fig = args.save_fig
 
     # Logger
-    logger = Logger('log.txt')
+    if args.load_baseline:
+        os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
+        label = 'equivalence' if args.check_gate_equivalence else f'fixed_{args.gate_override:g}'
+        logger = Logger(os.path.join(args.save_path, 'logs', f'{args.testing_data}_baseline_shared_gate_{label}.txt'))
+    else:
+        logger = Logger('log.txt')
 
     # Print basic information
     for key, value in sorted(vars(args).items()):
@@ -66,7 +83,11 @@ def train(args):
         fusion_mode=args.fusion_mode,
     ).to(device)
 
-    model.load(args.ckt_path)
+    if args.load_baseline:
+        count = model.load_baseline_for_shared_gate(args.ckt_path)
+        logger.info(f'Baseline import PASS: {count} detector tensors copied exactly; gate is untrained.')
+    else:
+        model.load(args.ckt_path)
     if args.gate_override is not None:
         if args.fusion_mode != "shared_gate" or not 0 <= args.gate_override <= 1:
             raise ValueError("--gate_override requires shared_gate and a value in [0, 1]")
@@ -85,17 +106,26 @@ def train(args):
                 else f"fixed_{args.gate_override:g}"
             )
             suffix = f'_shared_gate_{gate_label}'
+            if args.load_baseline:
+                suffix = '_baseline' + suffix
         csv_path = os.path.join(csv_root, f'{args.testing_data}{suffix}.csv')
         image_dir = os.path.join(image_root, f'{args.testing_data}{suffix}')
-        os.makedirs(image_dir, exist_ok=True)
-        os.makedirs(csv_root, exist_ok=True) # 新创建csv文件
-
         test_data_cls_names, test_data, test_data_root = get_data(
             dataset_type_list=args.testing_data,
             transform=model.preprocess,
             target_transform=model.transform,
             training=False)
 
+        if args.check_gate_equivalence:
+            from tools.gate_equivalence import representative_indices, check_gate_equivalence
+            indices = representative_indices(test_data, args.equivalence_per_group)
+            logger.info(f'Checking {len(indices)} images; HSF retained with paired RNG; no training or full evaluation.')
+            subset = torch.utils.data.Subset(test_data, indices)
+            loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False)
+            check_gate_equivalence(model, loader, logger)
+            return
+        os.makedirs(image_dir, exist_ok=True)
+        os.makedirs(csv_root, exist_ok=True)
         test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False)
         save_fig_flag = save_fig
 
@@ -208,6 +238,18 @@ if __name__ == '__main__':
         "--fusion_mode", type=str, default="add",
         choices=["add", "layer_gate", "shared_gate"],
         help="Prompt fusion mode used by the checkpoint",
+    )
+    parser.add_argument(
+        "--load_baseline", action="store_true",
+        help="Explicitly import an add checkpoint into shared_gate (requires a fixed gate for evaluation)",
+    )
+    parser.add_argument(
+        "--check_gate_equivalence", action="store_true",
+        help="Compare add and shared_gate=1 outputs on representative images, then exit without training",
+    )
+    parser.add_argument(
+        "--equivalence_per_group", type=int, default=1,
+        help="Images per (class, normal/anomalous) group for the equivalence check",
     )
     parser.add_argument(
         "--gate_override", type=float, default=None,

@@ -177,6 +177,42 @@ class AdaCLIP_Trainer(nn.Module):
                     f"Checkpoint {path} is missing shared gate weights: {missing_gate}"
                 )
 
+    def load_baseline_for_shared_gate(self, path):
+        """Explicitly import an add checkpoint, without relaxing normal load()."""
+        if self.fusion_mode != "shared_gate":
+            raise ValueError("Baseline import requires fusion_mode='shared_gate'")
+        state = torch.load(path, map_location="cpu")
+        current = self.state_dict()
+        expected = {
+            name for name in current
+            if any(part in name for part in self.base_parameter_names)
+        }
+        missing, unexpected = expected - set(state), set(state) - expected
+        if missing or unexpected:
+            raise ValueError(
+                f"Expected a complete add checkpoint without gate weights: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
+        invalid = [name for name, value in state.items()
+                   if not isinstance(value, torch.Tensor)
+                   or value.shape != current[name].shape
+                   or value.dtype != current[name].dtype
+                   or not torch.isfinite(value).all()]
+        if invalid:
+            raise ValueError(f"Invalid baseline tensor shape/dtype/value: {invalid}")
+        self.load_state_dict(state, strict=False)
+        gate = self.clip_model.shared_gate_generator
+        # Reset explicitly even when reusing a model that previously trained a gate.
+        nn.init.ones_(gate.norm.weight)
+        nn.init.zeros_(gate.norm.bias)
+        nn.init.zeros_(gate.proj.weight)
+        nn.init.zeros_(gate.proj.bias)
+        copied = self.state_dict()
+        if any(not torch.equal(value, copied[name].detach().cpu())
+               for name, value in state.items()):
+            raise RuntimeError("Baseline checkpoint was not copied exactly")
+        return len(expected)
+
     def detection_loss(self, anomaly_map, anomaly_score, items):
         if not isinstance(anomaly_map, list):
             anomaly_map = [anomaly_map]
