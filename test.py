@@ -25,8 +25,13 @@ def train(args):
     if args.load_baseline:
         if args.fusion_mode != "shared_gate":
             raise ValueError("--load_baseline requires --fusion_mode shared_gate")
-        if not args.check_gate_equivalence and args.gate_override is None:
+        if not (args.check_gate_equivalence or args.diagnose_prompt_scale) and args.gate_override is None:
             raise ValueError("An imported baseline has no learned gate; specify --gate_override")
+    if args.diagnose_prompt_scale:
+        if not args.load_baseline or args.testing_model != "dataset" or args.check_gate_equivalence:
+            raise ValueError("--diagnose_prompt_scale requires --load_baseline, dataset mode, and no equivalence flag")
+        if args.gate_override is not None or args.prompting_type != "SD" or args.equivalence_per_group < 1:
+            raise ValueError("Prompt diagnosis uses gates 1/0.5 internally; require SD, positive per-group count, no --gate_override")
     if args.check_gate_equivalence:
         if not args.load_baseline or args.testing_model != "dataset":
             raise ValueError("--check_gate_equivalence requires --load_baseline and dataset testing")
@@ -45,7 +50,10 @@ def train(args):
     # Logger
     if args.load_baseline:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
-        label = 'equivalence' if args.check_gate_equivalence else f'fixed_{args.gate_override:g}'
+        if args.diagnose_prompt_scale:
+            label = 'prompt_scale'
+        else:
+            label = 'equivalence' if args.check_gate_equivalence else f'fixed_{args.gate_override:g}'
         logger = Logger(os.path.join(args.save_path, 'logs', f'{args.testing_data}_baseline_shared_gate_{label}.txt'))
     else:
         logger = Logger('log.txt')
@@ -116,6 +124,15 @@ def train(args):
             target_transform=model.transform,
             training=False)
 
+        if args.diagnose_prompt_scale:
+            from tools.gate_equivalence import representative_indices, diagnose_prompt_scale
+            indices = representative_indices(test_data, args.equivalence_per_group)
+            subset = torch.utils.data.Subset(test_data, indices)
+            loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False)
+            output_path = os.path.join(save_root, 'diagnostics', f'{args.testing_data}_prompt_scale.json')
+            logger.info(f'Diagnosing {len(indices)} images; gates 1 vs 0.5; no training, HSF or full evaluation.')
+            diagnose_prompt_scale(model, loader, logger, output_path)
+            return
         if args.check_gate_equivalence:
             from tools.gate_equivalence import representative_indices, check_gate_equivalence
             indices = representative_indices(test_data, args.equivalence_per_group)
@@ -246,6 +263,10 @@ if __name__ == '__main__':
     parser.add_argument(
         "--check_gate_equivalence", action="store_true",
         help="Compare add and shared_gate=1 outputs on representative images, then exit without training",
+    )
+    parser.add_argument(
+        "--diagnose_prompt_scale", action="store_true",
+        help="Measure actual injected prompts before/after ln_1 at gates 1 and 0.5, without training",
     )
     parser.add_argument(
         "--equivalence_per_group", type=int, default=1,

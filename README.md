@@ -117,6 +117,45 @@ on the validation set as the final model.
 
 ### Shared gate experiment
 
+#### Prompt-scale diagnosis (no training)
+
+After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have
+similar effects. This diagnostic uses the same representative normal/anomalous
+images as the equivalence check and never selects a gate from their labels:
+
+```bash
+python test.py --fusion_mode shared_gate --load_baseline --diagnose_prompt_scale \
+  --ckt_path ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --testing_data visa --save_path ./workspaces/baseline_111_prompt_diag
+```
+
+The default is one normal and one anomalous image per available class (24 for
+VisA). Dynamic prompts are generated once per image. Two actual prompted-encoder
+passes use gates 1 and 0.5 with paired RNG. Hooks record freshly injected tokens
+immediately before and after each block's **actual `ln_1`**, retaining its learned
+affine parameters, epsilon and inference dtype. Captured tokens are checked
+against `compose_prompt`; hooks are never active during frozen-image conditioning.
+Text layer 0 is excluded because no prompt is injected there. Repeated text
+template batches are checked for consistency and counted only once per image.
+
+Output: `diagnostics/visa_prompt_scale.json` and
+`logs/visa_baseline_shared_gate_prompt_scale.txt` under the requested save path.
+An existing JSON report is never overwritten. Send these two files for analysis.
+Each JSON row identifies image, class, branch and zero-based layer; summaries
+report mean/median/min/max and valid counts across selected images.
+
+- `static_norm_mean`, `dynamic_norm_mean`: mean token L2 norms before fusion.
+- `dynamic_static_ratio`: ratio of those means, not a mean of token ratios.
+- `raw_cosine_mean`, `ln_cosine_mean`: mean tokenwise cosine between gate 1 and 0.5.
+- `raw_relative_l2`, `ln_relative_l2`: Frobenius norm of the difference divided
+  by the gate-1 reference norm, before/after the actual LayerNorm respectively.
+- Undefined zero-norm metrics remain JSON `null`; non-finite inputs abort.
+
+This does not run HSF, compute task metrics, train, or write checkpoints. Small
+post-LN differences alone do not imply identical detector outputs: the transformer
+residual path still carries the unnormalized prompts. This is a subset mechanism
+diagnostic, not evidence of statistical significance or generalization.
+
 #### Baseline-preserving equivalence check (no training)
 
 Use the original `add` checkpoint, not a dual-path/shared-gate checkpoint.
