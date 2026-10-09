@@ -22,15 +22,26 @@ setup_seed(111)
 
 def train(args):
     assert os.path.isfile(args.ckt_path), f"Please check the path of pre-trained model, {args.ckt_path} is not valid."
+    compare_shapes = getattr(args, 'compare_loss_shapes', False)
+    reference_path = getattr(args, 'source_reference_report', None)
+    if compare_shapes and (not args.diagnose_source_losses or not reference_path):
+        raise ValueError("--compare_loss_shapes requires --diagnose_source_losses and --source_reference_report")
+    if reference_path and not compare_shapes:
+        raise ValueError("--source_reference_report requires --compare_loss_shapes")
+    reference = None
+    diagnostic_name = 'source_gate_loss_shapes' if compare_shapes else 'source_gate_losses'
     if args.diagnose_source_losses:
         if (not args.load_baseline or args.testing_model != "dataset" or args.prompting_type != "SD"
                 or args.check_gate_equivalence or args.diagnose_prompt_scale or args.gate_override is not None):
             raise ValueError("Source diagnosis requires --load_baseline, SD, dataset mode and no other diagnostic/gate override")
         if args.source_samples_per_group < 1 or len(args.source_data) != len(set(args.source_data)):
             raise ValueError("Use positive source_samples_per_group and distinct source datasets")
-        report_path = os.path.join(args.save_path, 'diagnostics', 'source_gate_losses.json')
+        report_path = os.path.join(args.save_path, 'diagnostics', diagnostic_name + '.json')
         if os.path.exists(report_path):
             raise FileExistsError(f"Report exists; use a new --save_path: {report_path}")
+        if compare_shapes:
+            with open(reference_path, 'r') as handle:
+                reference = json.load(handle)
     if args.load_baseline:
         if args.fusion_mode != "shared_gate":
             raise ValueError("--load_baseline requires --fusion_mode shared_gate")
@@ -59,7 +70,7 @@ def train(args):
     # Logger
     if args.diagnose_source_losses:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
-        logger = Logger(os.path.join(args.save_path, 'logs', 'source_gate_losses.txt'))
+        logger = Logger(os.path.join(args.save_path, 'logs', diagnostic_name + '.txt'))
     elif args.load_baseline:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         if args.diagnose_prompt_scale:
@@ -129,7 +140,8 @@ def train(args):
                     "sources": args.source_data, "sample_seed": args.source_sample_seed,
                     "samples_per_group": args.source_samples_per_group, "sampling": sampling,
                     "image_size": args.image_size, "use_hsf": args.use_hsf, "k_clusters": args.k_clusters}
-        diagnose_source_losses(model, source_loaders, logger, report_path, metadata)
+        diagnose_source_losses(model, source_loaders, logger, report_path, metadata,
+                               compare_shapes=compare_shapes, reference=reference)
         return
 
     if args.testing_model == 'dataset':
@@ -300,6 +312,12 @@ if __name__ == '__main__':
         "--diagnose_source_losses", action="store_true",
         help="Diagnose classification/segmentation loss tradeoffs on source data only; no training",
     )
+    parser.add_argument(
+        "--compare_loss_shapes", action="store_true",
+        help="Also compute batch-preserving loss from identical predictions; source diagnostic only",
+    )
+    parser.add_argument("--source_reference_report", default=None,
+                        help="Previous source_gate_losses.json to verify identical configuration and sampled images")
     parser.add_argument(
         "--source_data", nargs='+', choices=['mvtec', 'colondb'], default=['mvtec', 'colondb'],
         help="Training-source datasets for loss diagnosis (never --testing_data)",

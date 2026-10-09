@@ -213,12 +213,20 @@ class AdaCLIP_Trainer(nn.Module):
             raise RuntimeError("Baseline checkpoint was not copied exactly")
         return len(expected)
 
-    def detection_loss(self, anomaly_map, anomaly_score, items, return_components=False):
+    def detection_loss(self, anomaly_map, anomaly_score, items, return_components=False,
+                       preserve_batch_dim=False):
         if not isinstance(anomaly_map, list):
             anomaly_map = [anomaly_map]
 
         gt = items['img_mask'].to(self.device)
-        gt = gt.squeeze()
+        if preserve_batch_dim:
+            # Opt-in diagnostic only: remove the mask channel, never the batch.
+            if gt.ndim == 4 and gt.shape[1] == 1:
+                gt = gt.squeeze(1)
+            if gt.ndim != 3 or any(am[:, 1].shape != gt.shape for am in anomaly_map):
+                raise ValueError("Batch-preserving loss requires masks [B,1,H,W] or [B,H,W] matching maps")
+        else:
+            gt = gt.squeeze()
 
         gt[gt > 0.5] = 1
         gt[gt <= 0.5] = 0

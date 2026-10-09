@@ -92,7 +92,25 @@ def summarize_losses(rows):
     return result
 
 
-def diagnose_source_losses(trainer, source_loaders, logger, output_path, metadata):
+def summarize_shape_effects(legacy_rows, batch_rows):
+    """Within-run effects of changing only target shape, not predictions."""
+    return {
+        "images": len(legacy_rows),
+        "preferred_gate_set_changed": {
+            m: sum(set(a['preferred_gates'][m]) != set(b['preferred_gates'][m])
+                   for a, b in zip(legacy_rows, batch_rows)) for m in METRICS},
+        "disjoint_task_minima": {
+            "legacy": sum(r['disjoint_task_minima'] for r in legacy_rows),
+            "batch_preserved": sum(r['disjoint_task_minima'] for r in batch_rows)},
+        "mean_batch_minus_legacy": {
+            g: {m: statistics.mean(b['losses'][g][m] - a['losses'][g][m]
+                                  for a, b in zip(legacy_rows, batch_rows)) for m in METRICS}
+            for g in legacy_rows[0]['losses']},
+    }
+
+
+def diagnose_source_losses(trainer, source_loaders, logger, output_path, metadata,
+                           compare_shapes=False, reference=None):
     path = Path(output_path)
     if path.exists():
         raise FileExistsError(f"Report already exists; use a new --save_path: {path}")
@@ -101,12 +119,21 @@ def diagnose_source_losses(trainer, source_loaders, logger, output_path, metadat
     source_names = [name for name, _ in source_loaders]
     if not source_names or len(source_names) != len(set(source_names)) or not set(source_names) <= {"mvtec", "colondb"}:
         raise ValueError("This source diagnosis supports distinct mvtec/colondb sources only")
+    if compare_shapes:
+        if reference is None or reference.get('gates') != list(GATES):
+            raise ValueError("Shape comparison requires the previous source report with matching gates")
+        for key in ('checkpoint', 'model', 'sources', 'sample_seed', 'samples_per_group',
+                    'sampling', 'image_size', 'use_hsf', 'k_clusters'):
+            if key not in metadata or reference.get('metadata', {}).get(key) != metadata[key]:
+                raise ValueError(f"Reference metadata mismatch: {key}; keep the original setup and sample")
+        if not reference.get('per_image'):
+            raise ValueError("Reference report has no images")
     model = trainer.clip_model
     flags = [(module, module.training) for module in model.modules()]
     rng = _rng_state()
     before = {name: value.detach().cpu().clone() for name, value in trainer.state_dict().items()
               if any(part in name for part in trainer.learnable_paramter_list)}
-    rows = []
+    rows, batch_rows = [], []
     try:
         model.eval()
         with torch.no_grad():
@@ -115,9 +142,15 @@ def diagnose_source_losses(trainer, source_loaders, logger, output_path, metadat
                 for items in loader:
                     if items["img"].shape[0] != 1:
                         raise ValueError("Source diagnosis requires batch size 1")
+                    identity = {"source": source, "class": items["cls_name"][0],
+                                "anomaly": int(items["anomaly"][0]), "image": items["img_path"][0]}
+                    if compare_shapes:
+                        expected = reference['per_image']
+                        if len(rows) >= len(expected) or any(expected[len(rows)].get(k) != v for k, v in identity.items()):
+                            raise ValueError(f"Reference image mismatch at index {len(rows)}")
                     image = items["img"].to(trainer.device)
                     paired_rng = _rng_state()
-                    losses = {}
+                    losses, batch_losses = {}, {}
                     for gate in GATES:
                         _restore_rng(paired_rng)
                         maps, scores = model(image, items["cls_name"], aggregation=False, gate_override=gate)
@@ -130,14 +163,31 @@ def diagnose_source_losses(trainer, source_loaders, logger, output_path, metadat
                         if not math.isclose(values["total"], values["classification"] + values["segmentation"], rel_tol=REL_TOL, abs_tol=ABS_TOL):
                             raise RuntimeError("Loss components do not sum to total")
                         losses[f"{gate:g}"] = values
-                    row = {"source": source, "class": items["cls_name"][0], "anomaly": int(items["anomaly"][0]),
-                           "image": items["img_path"][0], "losses": losses, **annotate_losses(losses)}
+                        if compare_shapes:
+                            # Reuse the exact maps/scores: no extra forward or HSF draw.
+                            targets = {**items, "img_mask": items["img_mask"].clone(), "anomaly": items["anomaly"].clone()}
+                            components = trainer.detection_loss(maps, scores, targets, return_components=True,
+                                                                preserve_batch_dim=True)
+                            preserved = {name: components[name].item() for name in METRICS}
+                            if not all(math.isfinite(v) for v in preserved.values()):
+                                raise RuntimeError("Non-finite batch-preserving loss")
+                            if preserved['classification'] != values['classification']:
+                                raise RuntimeError("Mask shape unexpectedly changed classification loss")
+                            if not math.isclose(preserved['total'], preserved['classification'] + preserved['segmentation'],
+                                                rel_tol=REL_TOL, abs_tol=ABS_TOL):
+                                raise RuntimeError("Batch-preserving components do not sum to total")
+                            batch_losses[f"{gate:g}"] = preserved
+                    row = {**identity, "losses": losses, **annotate_losses(losses)}
                     rows.append(row)
+                    if compare_shapes:
+                        batch_rows.append({**identity, 'losses': batch_losses, **annotate_losses(batch_losses)})
                     source_count += 1
                     logger.info(f'Source loss image={len(rows)} source={source} class={row["class"]} anomaly={row["anomaly"]} '
                                 f'preferred={row["preferred_gates"]} disjoint_task_minima={row["disjoint_task_minima"]}')
                 if source_count == 0:
                     raise ValueError(f"No images diagnosed for source: {source}")
+        if compare_shapes and len(rows) != len(reference['per_image']):
+            raise ValueError("Reference image count mismatch")
         current = trainer.state_dict()
         changed = [name for name, value in before.items() if not torch.equal(value, current[name].detach().cpu())]
         if changed:
@@ -158,12 +208,34 @@ def diagnose_source_losses(trainer, source_loaders, logger, output_path, metadat
                                       **summarize_losses([r for r in rows if (r["source"], r["class"], r["anomaly"]) == (s, c, a)])}
                                      for s, c, a in groups],
                   "unchanged_saved_tensors": len(before), "per_image": rows}
+        if compare_shapes:
+            report['notes'].extend([
+                "Top-level losses are legacy; batch_preserved uses gt.squeeze(1), retaining [B,H,W].",
+                "Both losses reuse identical predictions. Training defaults and BinaryDiceLoss are unchanged.",
+                "Reference metadata, sample indices and ordered image identities matched; image/checkpoint contents are not hashed.",
+                "Cross-run legacy loss deltas are recorded separately; RNG/hardware reproducibility across runs is not assumed."])
+            report['batch_preserved'] = {
+                'overall': summarize_losses(batch_rows),
+                'by_source': {s: summarize_losses([r for r in batch_rows if r['source'] == s]) for s in source_names},
+                'by_class_label': [{'source': s, 'class': c, 'anomaly': a,
+                                    **summarize_losses([r for r in batch_rows if (r['source'], r['class'], r['anomaly']) == (s, c, a)])}
+                                   for s, c, a in groups],
+                'per_image': batch_rows}
+            report['shape_effects'] = summarize_shape_effects(rows, batch_rows)
+            report['reference_check'] = {
+                'matched_images': len(rows),
+                'legacy_max_abs_delta': {g: {m: max(abs(r['losses'][g][m] - old['losses'][g][m])
+                                                     for r, old in zip(rows, reference['per_image']))
+                                             for m in METRICS} for g in rows[0]['losses']}}
+            logger.info('Loss shape comparison: ' + json.dumps(report['shape_effects'], allow_nan=False))
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("x", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, ensure_ascii=False, allow_nan=False)
         for source, summary in report["by_source"].items():
             logger.info(f'Source loss summary {source}: ' + json.dumps(summary, allow_nan=False))
         logger.info(f'Source loss summary: DONE; images={len(rows)}, unchanged_saved_tensors={len(before)}, report={path}')
+        if compare_shapes:
+            logger.info(f'Loss shape comparison: DONE; matched_reference_images={len(rows)}; same_predictions=True')
         return report
     finally:
         for module, training in flags:

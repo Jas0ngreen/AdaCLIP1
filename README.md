@@ -178,6 +178,38 @@ Successful completion logs `Source loss summary: DONE`. CPU regression tests:
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
+#### Paired legacy vs batch-preserving loss (diagnostic only)
+
+At batch size one, legacy `gt.squeeze()` removes the batch dimension, causing
+`BinaryDiceLoss` to reduce over rows. The optional comparison retains `[B,H,W]`
+with `squeeze(1)`. It does **not** change training defaults or `BinaryDiceLoss`.
+Each gate forwards only once; both loss calculations reuse identical predictions
+and independent target clones. Classification and pixel Focal are unchanged;
+the Dice reduction is the intended difference.
+
+```bash
+python test.py --fusion_mode shared_gate --load_baseline --diagnose_source_losses \
+  --compare_loss_shapes \
+  --source_reference_report ./workspaces/baseline_111_source_loss_diag/diagnostics/source_gate_losses.json \
+  --ckt_path ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --source_data mvtec colondb --source_samples_per_group 2 --source_sample_seed 111 \
+  --save_path ./workspaces/baseline_111_source_loss_shapes
+```
+
+The previous report is required. Configuration, sampling coverage/indices and
+ordered image paths/labels must match; a mismatch aborts without saving a report.
+This verifies identity metadata, not file contents (no image/checkpoint hashes).
+Old results are not overwritten. Cross-run legacy deltas are recorded separately
+since matching hardware/RNG across runs is not guaranteed.
+
+Send `diagnostics/source_gate_loss_shapes.json` and
+`logs/source_gate_loss_shapes.txt`. The JSON keeps legacy results at the top level,
+adds `batch_preserved` with the same detailed summaries and per-image losses,
+`shape_effects` with preference changes and paired loss deltas, and
+`reference_check` with sample matching and cross-run legacy deltas.
+Completion logs `Loss shape comparison: DONE`. This remains a small source-data
+diagnosis, not a training change, target evaluation, or evidence of improved AP.
+
 #### Prompt-scale diagnosis (no training)
 
 After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have
