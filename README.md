@@ -210,6 +210,51 @@ adds `batch_preserved` with the same detailed summaries and per-image losses,
 Completion logs `Loss shape comparison: DONE`. This remains a small source-data
 diagnosis, not a training change, target evaluation, or evidence of improved AP.
 
+#### Gate-only training directly from the original baseline
+
+```bash
+python train.py \
+  --fusion_mode shared_gate \
+  --gate_from_baseline ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --training_data mvtec colondb \
+  --batch_size 1 --epoch 0 --seed 111 \
+  --gate_epochs 3 --gate_learning_rate 0.001 \
+  --gate_utility_temperature 1 --gate_task_weight 0 \
+  --save_path ./workspaces/baseline_gate_111_batchdice
+```
+
+`--gate_from_baseline` requires shared gates, SD prompts, batch size one, and a
+new/empty output directory. It is mutually exclusive with `--resume_gate_from`.
+The complete ungated checkpoint is imported exactly using the existing strict
+baseline importer; the new gate starts at 0.5. Dual-path training is skipped.
+The imported detector is frozen, gradients cleared, and only gate parameters
+enter the fresh optimizer. `_base.pth` and `_final.pth` are written in the new
+directory; the input checkpoint is never overwritten.
+
+Gate-stage endpoint and optional task losses now retain the batch dimension.
+This applies to all shared-gate training entry points (including restarts), not
+to ordinary baseline/dual-path loss calls. Thus a restart is not an exact
+continuation of the old loss semantics. The endpoints remain 0 and 1, with
+target `sigmoid((loss_0 - loss_1) / temperature)`. Endpoint forwards and the
+optional gated task forward reuse paired Python/NumPy/Torch/CUDA RNG states;
+each loss receives independent target clones. The loss weights and temperature
+are not changed automatically. Non-finite endpoint/total losses abort before
+the optimizer step.
+
+Each epoch logs `Freeze check PASS` and `Gate training statistics` for utility
+targets, actual sigmoid gates, both endpoint losses and their difference:
+count/mean/population-std/min/max, plus fractions below 0.05 and above 0.95 for
+targets/gates. These are online, **pre-update training samples with existing
+augmentation**, not the final model evaluated on a fixed validation set.
+
+This new baseline-import mode does not load or evaluate the target dataset.
+It ends with `Baseline gate-only training: DONE`. Send the run's `logs/*.txt`
+first; evaluate the final model separately only after inspecting training.
+`--testing_data` is ignored in this mode, although the existing artifact naming
+still includes its default `visa` suffix and creates empty CSV/image directories.
+Sync `train.py` and `method/trainer.py`; the latter also uses the already-existing
+`tools/gate_equivalence.py` RNG helpers. No new runtime file is required.
+
 #### Prompt-scale diagnosis (no training)
 
 After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have

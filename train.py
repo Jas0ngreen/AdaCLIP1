@@ -20,27 +20,36 @@ from method import AdaCLIP_Trainer
 
 def validate_gate_resume(args):
     """Validate before setup_paths can create/replace any run artifacts."""
-    if not args.resume_gate_from:
+    baseline = getattr(args, 'gate_from_baseline', '')
+    if baseline and args.resume_gate_from:
+        raise ValueError("--gate_from_baseline and --resume_gate_from are mutually exclusive")
+    if not args.resume_gate_from and not baseline:
         return
     if args.fusion_mode != "shared_gate":
-        raise ValueError("--resume_gate_from requires --fusion_mode shared_gate")
-    source = Path(args.resume_gate_from).expanduser().resolve()
+        raise ValueError("Gate-only initialization requires --fusion_mode shared_gate")
+    if baseline and (args.prompting_type != 'SD' or args.batch_size != 1):
+        raise ValueError("--gate_from_baseline requires SD prompts and batch_size=1")
+    source = Path(baseline or args.resume_gate_from).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Stage-one checkpoint not found: {source}")
-    if not source.name.endswith("_base.pth"):
+    if not baseline and not source.name.endswith("_base.pth"):
         raise ValueError("--resume_gate_from must point to the stage-one *_base.pth, not *_final.pth")
     destination = Path(args.save_path).expanduser().resolve()
     if destination in source.parents:
         raise ValueError("Use a new --save_path outside the source checkpoint directory")
     if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
         raise ValueError("Gate restart requires a new or empty --save_path to preserve existing results")
-    args.resume_gate_from = str(source)
+    if baseline:
+        args.gate_from_baseline = str(source)
+    else:
+        args.resume_gate_from = str(source)
 
 
 def train(args):
     validate_gate_resume(args)
+    from_baseline = bool(getattr(args, 'gate_from_baseline', ''))
     if args.fusion_mode == "shared_gate":
-        if (not args.resume_gate_from and args.epoch <= 0) or args.gate_epochs <= 0:
+        if (not (args.resume_gate_from or from_baseline) and args.epoch <= 0) or args.gate_epochs <= 0:
             raise ValueError("--epoch (unless restarting gates) and --gate_epochs must be positive")
         if args.gate_utility_temperature <= 0:
             raise ValueError("--gate_utility_temperature must be positive")
@@ -97,7 +106,11 @@ def train(args):
         gate_learning_rate=args.gate_learning_rate,
     ).to(device)
 
-    if args.resume_gate_from:
+    if from_baseline:
+        count = model.load_baseline_for_shared_gate(args.gate_from_baseline)
+        logger.info(f'Baseline import PASS: {count} detector tensors copied exactly; gate initialized at 0.5.')
+        logger.info('Skipping dual-path training; source-only gate training, no target dataset loading/evaluation.')
+    elif args.resume_gate_from:
         model.load(args.resume_gate_from, require_complete=True)
         logger.info(f'Restarting gate training from: {args.resume_gate_from}')
         logger.info('Skipping dual-path training; optimizer and RNG restart fresh (not exact continuation).')
@@ -108,20 +121,21 @@ def train(args):
         target_transform=model.transform,
         training=True)
 
-    test_data_cls_names, test_data, test_data_root = get_data(
-        dataset_type_list=args.testing_data,
-        transform=model.preprocess,
-        target_transform=model.transform,
-        training=False)
-
-    logger.info('Data Root: training, {:}; testing, {:}'.format(train_data_root, test_data_root))
-
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False)
+    if not from_baseline:
+        test_data_cls_names, test_data, test_data_root = get_data(
+            dataset_type_list=args.testing_data,
+            transform=model.preprocess,
+            target_transform=model.transform,
+            training=False)
+        logger.info('Data Root: training, {:}; testing, {:}'.format(train_data_root, test_data_root))
+        test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False)
+    else:
+        logger.info(f'Data Root: training, {train_data_root}; --testing_data ignored.')
 
     if args.fusion_mode == "shared_gate":
         # Train both reference paths on the auxiliary data. The gate is bypassed.
-        if not args.resume_gate_from:
+        if not (args.resume_gate_from or from_baseline):
             for epoch in tqdm(range(epochs), desc="dual-path training"):
                 loss = model.train_epoch(train_dataloader, stage="dual")
                 logger.info(f'dual epoch [{epoch + 1}/{epochs}], loss:{loss:.4f}')
@@ -131,6 +145,8 @@ def train(args):
         model.save(ckp_path + '_base.pth')
 
         model.prepare_shared_gate_training()
+        logger.info('Gate objective: endpoints=0,1; batch-preserving loss; paired RNG; '
+                    'cloned targets. Epoch statistics use training images/augmentations and pre-update gates.')
         for epoch in tqdm(range(args.gate_epochs), desc="shared-gate training"):
             loss = model.train_epoch(
                 train_dataloader,
@@ -147,11 +163,19 @@ def train(args):
                 f'gate epoch [{epoch + 1}/{args.gate_epochs}], loss:{loss:.4f}'
             )
             tensorboard_logger.add_scalar('gate/loss', loss, epoch)
+            logger.info('Gate training statistics: ' + json.dumps(model.last_gate_training_statistics, allow_nan=False))
+            for name, values in model.last_gate_training_statistics.items():
+                for metric, value in values.items():
+                    tensorboard_logger.add_scalar(f'gate_train/{name}/{metric}', value, epoch)
 
         # The target dataset is evaluated only after training; it never selects a checkpoint.
         final_path = ckp_path + '_final.pth'
         model.save(final_path)
         logger.info(f'Final shared-gate checkpoint: {final_path}')
+        if from_baseline:
+            logger.info('Baseline gate-only training: DONE; no target evaluation performed.')
+            tensorboard_logger.close()
+            return
         metric_dict = model.evaluation(
             test_dataloader,
             test_data_cls_names,
@@ -328,6 +352,10 @@ if __name__ == '__main__':
         help="Learning rate for layer-wise Gate modules"
     )
 
+    parser.add_argument(
+        "--gate_from_baseline", type=str, default="",
+        help="Import an add baseline and train only gates on source data; new save_path, no target evaluation",
+    )
     parser.add_argument(
         "--resume_gate_from", type=str, default="",
         help="Restart only shared-gate training from a stage-one *_base.pth; use a new --save_path",

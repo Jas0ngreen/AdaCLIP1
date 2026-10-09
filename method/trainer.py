@@ -6,6 +6,7 @@ from scipy.ndimage import gaussian_filter
 
 from loss import FocalLoss, BinaryDiceLoss
 from tools import visualization, calculate_metric, calculate_average_metric
+from tools.gate_equivalence import _rng_state, _restore_rng
 from .adaclip import *
 from .custom_clip import create_model_and_transforms
 
@@ -317,22 +318,32 @@ class AdaCLIP_Trainer(nn.Module):
         if image.shape[0] != 1:
             raise ValueError("Shared gate utility training currently requires batch size 1")
         cls_name = items['cls_name']
+        # Legacy detection_loss thresholds labels in-place. Do not share them
+        # between teacher endpoints or the optional differentiable task loss.
+        def targets():
+            return {**items, 'img_mask': items['img_mask'].clone(),
+                    'anomaly': items['anomaly'].clone()}
 
         with torch.no_grad():
+            paired_rng = _rng_state()
             static_map, static_score = self.clip_model(
                 image, cls_name, aggregation=False, gate_override=0.0
             )
-            static_loss = self.detection_loss(static_map, static_score, items)
+            static_loss = self.detection_loss(static_map, static_score, targets(), preserve_batch_dim=True)
+            _restore_rng(paired_rng)
             dynamic_map, dynamic_score = self.clip_model(
                 image, cls_name, aggregation=False, gate_override=1.0
             )
-            dynamic_loss = self.detection_loss(dynamic_map, dynamic_score, items)
+            dynamic_loss = self.detection_loss(dynamic_map, dynamic_score, targets(), preserve_batch_dim=True)
+            if not torch.isfinite(static_loss).all() or not torch.isfinite(dynamic_loss).all():
+                raise RuntimeError("Non-finite gate endpoint loss")
             utility_target = torch.sigmoid(
                 (static_loss - dynamic_loss) / utility_temperature
             )
 
         gated_map = gated_score = None
         if task_weight > 0:
+            _restore_rng(paired_rng)
             gated_map, gated_score = self.clip_model(
                 image, cls_name, aggregation=False
             )
@@ -347,8 +358,17 @@ class AdaCLIP_Trainer(nn.Module):
         loss = utility_loss
         if task_weight > 0:
             loss = loss + task_weight * self.detection_loss(
-                gated_map, gated_score, items
+                gated_map, gated_score, targets(), preserve_batch_dim=True
             )
+
+        if not torch.isfinite(loss).all() or not torch.isfinite(gate_logits).all():
+            raise RuntimeError("Non-finite gate training loss/logits")
+        self.last_gate_batch_statistics = {
+            'utility_target': utility_target.detach().item(),
+            'gate': gate_logits.detach().sigmoid().item(),
+            'static_loss': static_loss.item(), 'dynamic_loss': dynamic_loss.item(),
+            'loss_delta': (static_loss - dynamic_loss).item(),
+        }
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -363,6 +383,7 @@ class AdaCLIP_Trainer(nn.Module):
         else:
             self.clip_model.train()
         loss_list = []
+        gate_records = []
         for items in loader:
             if stage == "dual":
                 gate_override = float(torch.randint(0, 2, ()).item())
@@ -371,11 +392,26 @@ class AdaCLIP_Trainer(nn.Module):
                 loss = self.train_shared_gate_batch(
                     items, utility_temperature, task_weight
                 )
+                gate_records.append(self.last_gate_batch_statistics)
             elif stage == "standard":
                 loss = self.train_one_batch(items)
             else:
                 raise ValueError(f"Unknown training stage: {stage}")
             loss_list.append(loss.item())
+
+        if stage == 'gate':
+            if not gate_records:
+                raise ValueError("Gate training source loader is empty")
+            self.last_gate_training_statistics = {}
+            for name in gate_records[0]:
+                values = torch.tensor([row[name] for row in gate_records], dtype=torch.float64)
+                stats = {'count': len(gate_records), 'mean': values.mean().item(),
+                         'std': values.std(unbiased=False).item(),
+                         'min': values.min().item(), 'max': values.max().item()}
+                if name in ('utility_target', 'gate'):
+                    stats.update(near0=(values < .05).double().mean().item(),
+                                 near1=(values > .95).double().mean().item())
+                self.last_gate_training_statistics[name] = stats
 
         return np.mean(loss_list)
 
