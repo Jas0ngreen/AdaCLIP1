@@ -22,10 +22,19 @@ setup_seed(111)
 
 def train(args):
     assert os.path.isfile(args.ckt_path), f"Please check the path of pre-trained model, {args.ckt_path} is not valid."
+    if args.diagnose_source_losses:
+        if (not args.load_baseline or args.testing_model != "dataset" or args.prompting_type != "SD"
+                or args.check_gate_equivalence or args.diagnose_prompt_scale or args.gate_override is not None):
+            raise ValueError("Source diagnosis requires --load_baseline, SD, dataset mode and no other diagnostic/gate override")
+        if args.source_samples_per_group < 1 or len(args.source_data) != len(set(args.source_data)):
+            raise ValueError("Use positive source_samples_per_group and distinct source datasets")
+        report_path = os.path.join(args.save_path, 'diagnostics', 'source_gate_losses.json')
+        if os.path.exists(report_path):
+            raise FileExistsError(f"Report exists; use a new --save_path: {report_path}")
     if args.load_baseline:
         if args.fusion_mode != "shared_gate":
             raise ValueError("--load_baseline requires --fusion_mode shared_gate")
-        if not (args.check_gate_equivalence or args.diagnose_prompt_scale) and args.gate_override is None:
+        if not (args.check_gate_equivalence or args.diagnose_prompt_scale or args.diagnose_source_losses) and args.gate_override is None:
             raise ValueError("An imported baseline has no learned gate; specify --gate_override")
     if args.diagnose_prompt_scale:
         if not args.load_baseline or args.testing_model != "dataset" or args.check_gate_equivalence:
@@ -48,7 +57,10 @@ def train(args):
     save_fig = args.save_fig
 
     # Logger
-    if args.load_baseline:
+    if args.diagnose_source_losses:
+        os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
+        logger = Logger(os.path.join(args.save_path, 'logs', 'source_gate_losses.txt'))
+    elif args.load_baseline:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         if args.diagnose_prompt_scale:
             label = 'prompt_scale'
@@ -99,6 +111,26 @@ def train(args):
     if args.gate_override is not None:
         if args.fusion_mode != "shared_gate" or not 0 <= args.gate_override <= 1:
             raise ValueError("--gate_override requires shared_gate and a value in [0, 1]")
+
+    if args.diagnose_source_losses:
+        from tools.source_loss_diagnostics import select_source_samples, diagnose_source_losses
+        logger.info('SOURCE-ONLY diagnostic: --testing_data is ignored; no target dataset will be loaded.')
+        source_loaders, sampling = [], {}
+        for source in args.source_data:
+            _, source_dataset, source_root = get_data(
+                dataset_type_list=source, transform=model.preprocess,
+                target_transform=model.transform, training=False)
+            indices, coverage = select_source_samples(source_dataset, args.source_samples_per_group, args.source_sample_seed)
+            sampling[source] = {"root": source_root, "coverage": coverage}
+            subset = torch.utils.data.Subset(source_dataset, indices)
+            source_loaders.append((source, torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False)))
+            logger.info(f'Source={source}: sampled={len(indices)}, augmentation=off, metadata_population=test')
+        metadata = {"checkpoint": os.path.abspath(args.ckt_path), "model": args.model,
+                    "sources": args.source_data, "sample_seed": args.source_sample_seed,
+                    "samples_per_group": args.source_samples_per_group, "sampling": sampling,
+                    "image_size": args.image_size, "use_hsf": args.use_hsf, "k_clusters": args.k_clusters}
+        diagnose_source_losses(model, source_loaders, logger, report_path, metadata)
+        return
 
     if args.testing_model == 'dataset':
         assert args.testing_data in dataset_dict.keys(), f"You entered {args.testing_data}, but we only support " \
@@ -264,6 +296,18 @@ if __name__ == '__main__':
         "--check_gate_equivalence", action="store_true",
         help="Compare add and shared_gate=1 outputs on representative images, then exit without training",
     )
+    parser.add_argument(
+        "--diagnose_source_losses", action="store_true",
+        help="Diagnose classification/segmentation loss tradeoffs on source data only; no training",
+    )
+    parser.add_argument(
+        "--source_data", nargs='+', choices=['mvtec', 'colondb'], default=['mvtec', 'colondb'],
+        help="Training-source datasets for loss diagnosis (never --testing_data)",
+    )
+    parser.add_argument("--source_samples_per_group", type=int, default=2,
+                        help="Sample at most N images per source/class/label group")
+    parser.add_argument("--source_sample_seed", type=int, default=111,
+                        help="Local stratified sampling seed; inference keeps the existing test seed")
     parser.add_argument(
         "--diagnose_prompt_scale", action="store_true",
         help="Measure actual injected prompts before/after ln_1 at gates 1 and 0.5, without training",

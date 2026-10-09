@@ -213,7 +213,7 @@ class AdaCLIP_Trainer(nn.Module):
             raise RuntimeError("Baseline checkpoint was not copied exactly")
         return len(expected)
 
-    def detection_loss(self, anomaly_map, anomaly_score, items):
+    def detection_loss(self, anomaly_map, anomaly_score, items, return_components=False):
         if not isinstance(anomaly_map, list):
             anomaly_map = [anomaly_map]
 
@@ -239,6 +239,8 @@ class AdaCLIP_Trainer(nn.Module):
                          self.loss_dice(am[:, 0, :, :], 1-gt))
 
         loss += seg_loss
+        if return_components:
+            return {"classification": classification_loss, "segmentation": seg_loss, "total": loss}
         return loss
 
     def train_one_batch(self, items, gate_override=None):

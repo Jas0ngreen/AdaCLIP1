@@ -117,6 +117,67 @@ on the validation set as the final model.
 
 ### Shared gate experiment
 
+#### Source classification/localization loss diagnosis (no training)
+
+Compare the existing training objective on **MVTec + ColonDB source data**, not
+VisA. This is a small paired diagnostic before deciding whether gate supervision
+is useful, not a weight sweep on the target dataset:
+
+```bash
+python test.py --fusion_mode shared_gate --load_baseline --diagnose_source_losses \
+  --ckt_path ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --source_data mvtec colondb --source_samples_per_group 2 --source_sample_seed 111 \
+  --save_path ./workspaces/baseline_111_source_loss_diag
+```
+
+Runtime files to sync: `test.py`, `method/trainer.py`, and the new
+`tools/source_loss_diagnostics.py` (which also imports the existing
+`tools/gate_equivalence.py`). Source mode returns before target loading;
+`--testing_data` is ignored even if the ordinary default `visa` appears in the
+argument log. The source options deliberately only allow `mvtec` and `colondb`.
+
+The sampler uses a local seeded RNG, selecting at most two images from each
+source/class/normal-or-anomalous group without replacement. Absent groups are
+not fabricated; the JSON records available counts and exact selected indices.
+The source dataset constructors use `training=False` to disable random composite
+augmentation. This repository uses `meta['test']` as its source training population
+too: these are **not held-out validation data**.
+
+Each sampled image is forwarded with gates `1`, `0.5`, `0.01`, under `eval()` and
+`no_grad()` with identical input and paired Python/NumPy/Torch/CUDA random states.
+HSF is retained when enabled. `aggregation=False` preserves the gate-utility
+training forward path. The existing `detection_loss(..., return_components=True)`
+returns classification Focal, the sum of per-layer pixel Focal plus two Dice
+terms, and their unchanged total. The default loss return value and gradients
+remain unchanged. Legacy target squeezing and Dice reduction behavior is retained,
+not silently corrected by this diagnostic. Targets are cloned per forward because
+the existing loss thresholds them in place.
+
+The report records raw losses, paired deltas, all tied minima, opposite task
+preferences, and cases where total loss improves while one task worsens. Comparisons
+use `abs_tol=1e-6`, `rel_tol=1e-5`; ties count towards all tied candidates.
+It provides per-source/class/label and sampled-image overall summaries. These
+are descriptive losses, not AUROC/AP, statistical significance, dataset-weighted
+estimates, or evidence of unseen-target generalization. Original endpoint targets
+used gates 0 and 1; this diagnostic instead probes the three stated candidates
+and does not claim to recreate the old utility targets.
+
+No optimizer or checkpoint save is called. Saved detector/gate tensors are
+compared before/after; a change, non-finite loss, or inconsistent component sum
+aborts. The frozen CLIP backbone is not cloned for this check. An existing JSON
+report is never overwritten; use a new output directory to repeat the diagnostic.
+
+Send these two files under the new save directory:
+
+- `diagnostics/source_gate_losses.json`
+- `logs/source_gate_losses.txt`
+
+Successful completion logs `Source loss summary: DONE`. CPU regression tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
 #### Prompt-scale diagnosis (no training)
 
 After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have
