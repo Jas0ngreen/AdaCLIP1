@@ -375,9 +375,32 @@ class AdaCLIP_Trainer(nn.Module):
         self.optimizer.step()
         return loss
 
+    def train_direct_gate_batch(self, items):
+        """Actual gated task loss only: no endpoint teacher and no BCE."""
+        image = items['img'].to(self.device)
+        if image.shape[0] != 1:
+            raise ValueError("Direct gate training requires batch size 1")
+        maps, scores = self.clip_model(image, items['cls_name'], aggregation=False)
+        targets = {**items, 'img_mask': items['img_mask'].clone(), 'anomaly': items['anomaly'].clone()}
+        components = self.detection_loss(maps, scores, targets, return_components=True,
+                                         preserve_batch_dim=True)
+        gate = self.clip_model.shared_gate_logits.sigmoid()
+        if not all(torch.isfinite(value).all() for value in (*components.values(), gate)):
+            raise RuntimeError("Non-finite direct gate loss/output")
+        loss = components['total']
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        grads = [p.grad for p in self.clip_model.shared_gate_generator.parameters() if p.grad is not None]
+        if not grads or any(not torch.isfinite(g).all() for g in grads):
+            raise RuntimeError("Missing or non-finite direct gate gradients")
+        self.last_gate_batch_statistics = {k: v.detach().item() for k, v in components.items()}
+        self.last_gate_batch_statistics['gate'] = gate.detach().item()
+        self.optimizer.step()
+        return loss
+
     def train_epoch(self, loader, stage="standard", utility_temperature=1.0,
                     task_weight=1.0):
-        if stage == "gate":
+        if stage in ("gate", "gate_direct"):
             self.assert_shared_gate_frozen()
             self.clip_model.eval()
         else:
@@ -395,11 +418,14 @@ class AdaCLIP_Trainer(nn.Module):
                 gate_records.append(self.last_gate_batch_statistics)
             elif stage == "standard":
                 loss = self.train_one_batch(items)
+            elif stage == 'gate_direct':
+                loss = self.train_direct_gate_batch(items)
+                gate_records.append(self.last_gate_batch_statistics)
             else:
                 raise ValueError(f"Unknown training stage: {stage}")
             loss_list.append(loss.item())
 
-        if stage == 'gate':
+        if stage in ('gate', 'gate_direct'):
             if not gate_records:
                 raise ValueError("Gate training source loader is empty")
             self.last_gate_training_statistics = {}

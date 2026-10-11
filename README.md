@@ -255,6 +255,62 @@ still includes its default `visa` suffix and creates empty CSV/image directories
 Sync `train.py` and `method/trainer.py`; the latter also uses the already-existing
 `tools/gate_equivalence.py` RNG helpers. No new runtime file is required.
 
+#### Small direct-loss pilot with source-only gate validation
+
+This is a separate one-epoch feasibility experiment, not a continuation of the
+utility-BCE gate checkpoint. It imports the original add baseline, freezes the
+detector and minimizes **actual gated classification + batch-preserving
+segmentation loss**, with no endpoint teacher or BCE. The initial gate is 0.5.
+
+```bash
+python train.py \
+  --fusion_mode shared_gate --direct_gate_pilot \
+  --gate_from_baseline ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --training_data mvtec colondb \
+  --batch_size 1 --epoch 0 --gate_epochs 1 --seed 111 \
+  --gate_learning_rate 0.001 --gate_task_weight 0 \
+  --pilot_train_per_group 8 --pilot_val_per_group 2 --pilot_split_seed 111 \
+  --save_path ./workspaces/baseline_gate_111_direct_pilot
+```
+
+Sync `train.py`, `method/trainer.py`, and **new runtime file
+`tools/direct_gate_pilot.py`**. It uses the existing RNG helpers in
+`tools/gate_equivalence.py`. No changes to ordinary baseline training or the
+existing utility-training mode are made by enabling this opt-in route.
+
+The seeded split samples 8 training and 2 validation images per available
+source/class/label group without replacement. Duplicate image paths and
+insufficient groups fail explicitly. ColonDB's absent normal group is not
+invented. With the previously observed source metadata, this gives 248 train
+and 62 validation images; the log and manifest give the actual counts.
+Both subsets use `training=False`: this disables composite augmentation, which
+otherwise samples from the entire class pool and could leak validation images
+into training. Source validation is held out **from this gate fit only**;
+the original detector may have trained on these images. No VisA is loaded.
+
+Only the gate optimizer updates parameters. Training uses eval mode but retains
+autograd through the gated forward; missing/non-finite gate gradients abort.
+After exactly one epoch, detector tensors are checked unchanged and the final
+checkpoint is saved. There is no best-checkpoint search or automatic extra epoch.
+
+The frozen final model is then evaluated on **both** train and validation subsets
+against fixed gates 1 and 0.5, with identical per-image RNG across modes,
+`aggregation=False`, and batch-preserving loss. This separates post-fit training
+fit from validation performance, rather than comparing online pre-update training
+loss against a final validation loss. Reported values are losses, not AUROC/AP.
+Summaries include classification/segmentation/total means, per-source/class/label
+breakdowns, paired improve/tie/worsen counts, per-image losses and final gate
+distributions. Tie tolerances are 1e-6 absolute and 1e-5 relative. They are
+sampled-image means, not population-weighted estimates or statistical significance.
+
+Use a new or empty output directory; existing reports/checkpoints are protected
+by the training-entry guard. Completion logs `Direct gate pilot: DONE`.
+Send `diagnostics/direct_gate_pilot.json` and the training log under `logs/`.
+`diagnostics/source_split.json` retains exact indices/paths/labels for auditing
+and reproducing the split. The old artifact naming may still contain `visa`,
+`GT1` and `GW0`; these do not imply target evaluation or utility BCE in this mode.
+The dedicated output directory, CLI flag, log and report identify the objective.
+
 #### Prompt-scale diagnosis (no training)
 
 After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have

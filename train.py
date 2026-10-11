@@ -48,6 +48,17 @@ def validate_gate_resume(args):
 def train(args):
     validate_gate_resume(args)
     from_baseline = bool(getattr(args, 'gate_from_baseline', ''))
+    direct_pilot = getattr(args, 'direct_gate_pilot', False)
+    if direct_pilot:
+        if not from_baseline or args.gate_epochs != 1 or args.epoch != 0:
+            raise ValueError("--direct_gate_pilot requires --gate_from_baseline, --epoch 0 and --gate_epochs 1")
+        if args.gate_task_weight != 0:
+            raise ValueError("Direct pilot uses pure task loss; leave --gate_task_weight 0 (legacy option ignored)")
+        if (not args.training_data or len(set(args.training_data)) != len(args.training_data)
+                or not set(args.training_data) <= {'mvtec', 'colondb'}):
+            raise ValueError("Direct pilot only accepts distinct mvtec/colondb training sources")
+        if args.pilot_train_per_group < 1 or args.pilot_val_per_group < 1:
+            raise ValueError("Pilot per-group sample counts must be positive")
     if args.fusion_mode == "shared_gate":
         if (not (args.resume_gate_from or from_baseline) and args.epoch <= 0) or args.gate_epochs <= 0:
             raise ValueError("--epoch (unless restarting gates) and --gate_epochs must be positive")
@@ -114,6 +125,14 @@ def train(args):
         model.load(args.resume_gate_from, require_complete=True)
         logger.info(f'Restarting gate training from: {args.resume_gate_from}')
         logger.info('Skipping dual-path training; optimizer and RNG restart fresh (not exact continuation).')
+
+    if direct_pilot:
+        from tools.direct_gate_pilot import run_direct_gate_pilot
+        try:
+            run_direct_gate_pilot(model, args, logger, ckp_path, get_data)
+        finally:
+            tensorboard_logger.close()
+        return
 
     train_data_cls_names, train_data, train_data_root = get_data(
         dataset_type_list=args.training_data,
@@ -352,6 +371,13 @@ if __name__ == '__main__':
         help="Learning rate for layer-wise Gate modules"
     )
 
+    parser.add_argument(
+        "--direct_gate_pilot", action="store_true",
+        help="One-epoch pure task-loss gate pilot with disjoint source train/validation subsets; no target data",
+    )
+    parser.add_argument("--pilot_train_per_group", type=int, default=8)
+    parser.add_argument("--pilot_val_per_group", type=int, default=2)
+    parser.add_argument("--pilot_split_seed", type=int, default=111)
     parser.add_argument(
         "--gate_from_baseline", type=str, default="",
         help="Import an add baseline and train only gates on source data; new save_path, no target evaluation",
