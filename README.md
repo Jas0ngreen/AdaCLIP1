@@ -311,6 +311,75 @@ and reproducing the split. The old artifact naming may still contain `visa`,
 `GT1` and `GW0`; these do not imply target evaluation or utility BCE in this mode.
 The dedicated output directory, CLI flag, log and report identify the objective.
 
+#### Visual prompt Value-contribution diagnosis (no training)
+
+This opt-in experiment tests the **location** of prompt control. It imports the
+original add baseline, reuses the exact source validation image paths/classes/
+labels recorded in `direct_gate_pilot.json`, and exits before loading any target
+dataset. It does not use the trained pilot checkpoint. This is a mechanism probe,
+not a new training mode or a claim of improved AUROC/AP.
+
+Synchronize `test.py` and the new runtime file
+**`tools/prompt_contribution_diagnostics.py`**, retaining the existing
+`tools/gate_equivalence.py` helpers. Then run from the server repository root:
+
+```bash
+python test.py \
+  --fusion_mode shared_gate --load_baseline --diagnose_prompt_contribution \
+  --ckt_path ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --contribution_reference_report ./workspaces/baseline_gate_111_direct_pilot/diagnostics/direct_gate_pilot.json \
+  --batch_size 1 \
+  --save_path ./workspaces/baseline_111_prompt_contribution_diag
+```
+
+The diagnostic requires SD/VL, depth 4 and the same backbone, image size, prompt
+length, HSF configuration and original baseline path as the pilot. Missing or
+duplicate recorded images, class/label mismatches, and an existing output JSON
+abort. `--testing_data` and source sampling flags are ignored. Image/checkpoint
+contents are not hashed; keep the original data and baseline file unchanged.
+
+Five paired forwards per image, using eval/no_grad and restored RNG including HSF:
+
+1. `baseline`: actual add fusion, no shared gate generator.
+2. `contribution_1`: unchanged prompt contribution, checked against baseline at
+   output and intermediate-feature levels (atol=1e-6, rtol=1e-5).
+3. `amplitude_shared_0.5`: existing dynamic-prompt amplitude gate, both branches.
+4. `amplitude_visual_0.5`: amplitude control only in the visual branch, keeping
+   the text branch at baseline. This separates branch scope from gate location.
+5. `contribution_0.5`: keep hybrid prompt tokens at baseline; scale only their
+   projected Value contribution to CLS/patch queries in the first four visual
+   blocks. Prompt queries and the text branch are not directly modified.
+
+At each block's current input, Q/K/softmax are unchanged. The diagnostic subtracts
+half of `A_image,prompt V_prompt W_out` from native attention outputs for image
+queries. V includes the projection bias; the correction excludes output bias.
+This is **not** dropping prompt keys or scaling attention logits. Contribution=0
+would not mean static-only inference. Earlier interventions can change later
+blocks' inputs, including subsequent Q/K. Two gates of 0.5 are not equal-strength
+perturbations. A larger feature change alone does not show a better detector.
+
+Temporary hooks are active only inside prompted visual forwards, never during
+the initial unprompted image conditioning. Full attention weights are recomputed
+in query chunks for the correction, avoiding a second full attention matrix.
+Unsupported attention layouts fail explicitly; no modern per-head MHA API is
+required, preserving Torch 1.10 compatibility. Native model code stays unchanged.
+
+The report contains paired classification/segmentation/total losses (batch-preserving
+Dice, aggregation=False), class/label breakdowns, intermediate attention changes,
+projected feature changes **before** final L2 normalization, output score/map
+changes, and local prompt-message norms. All saved detector/gate tensors and
+model tensor version counters are checked unchanged. Hooks, mode/gradient flags
+and RNG are restored even on failure. No optimizer, training or checkpoint save.
+
+Successful completion logs `Prompt contribution: DONE`. Send both files:
+
+- `workspaces/baseline_111_prompt_contribution_diag/diagnostics/source_prompt_contribution.json`
+- `workspaces/baseline_111_prompt_contribution_diag/logs/source_prompt_contribution.txt`
+
+The reused source images were held out only from the pilot gate fit; they are
+not baseline-unseen validation. Keep this diagnostic separate from final target
+evaluation and do not select deployment gates using its per-image labels.
+
 #### Prompt-scale diagnosis (no training)
 
 After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have

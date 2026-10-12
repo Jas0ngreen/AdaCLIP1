@@ -22,6 +22,12 @@ setup_seed(111)
 
 def train(args):
     assert os.path.isfile(args.ckt_path), f"Please check the path of pre-trained model, {args.ckt_path} is not valid."
+    contribution = getattr(args, 'diagnose_prompt_contribution', False)
+    if contribution:
+        from tools.prompt_contribution_diagnostics import validate_args
+        validate_args(args)
+    elif getattr(args, 'contribution_reference_report', None):
+        raise ValueError('--contribution_reference_report requires --diagnose_prompt_contribution')
     compare_shapes = getattr(args, 'compare_loss_shapes', False)
     reference_path = getattr(args, 'source_reference_report', None)
     if compare_shapes and (not args.diagnose_source_losses or not reference_path):
@@ -45,7 +51,7 @@ def train(args):
     if args.load_baseline:
         if args.fusion_mode != "shared_gate":
             raise ValueError("--load_baseline requires --fusion_mode shared_gate")
-        if not (args.check_gate_equivalence or args.diagnose_prompt_scale or args.diagnose_source_losses) and args.gate_override is None:
+        if not (contribution or args.check_gate_equivalence or args.diagnose_prompt_scale or args.diagnose_source_losses) and args.gate_override is None:
             raise ValueError("An imported baseline has no learned gate; specify --gate_override")
     if args.diagnose_prompt_scale:
         if not args.load_baseline or args.testing_model != "dataset" or args.check_gate_equivalence:
@@ -68,7 +74,10 @@ def train(args):
     save_fig = args.save_fig
 
     # Logger
-    if args.diagnose_source_losses:
+    if contribution:
+        os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
+        logger = Logger(os.path.join(args.save_path, 'logs', 'source_prompt_contribution.txt'))
+    elif args.diagnose_source_losses:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         logger = Logger(os.path.join(args.save_path, 'logs', diagnostic_name + '.txt'))
     elif args.load_baseline:
@@ -122,6 +131,11 @@ def train(args):
     if args.gate_override is not None:
         if args.fusion_mode != "shared_gate" or not 0 <= args.gate_override <= 1:
             raise ValueError("--gate_override requires shared_gate and a value in [0, 1]")
+
+    if contribution:
+        from tools.prompt_contribution_diagnostics import run_diagnostic
+        run_diagnostic(model, args, logger, get_data)
+        return
 
     if args.diagnose_source_losses:
         from tools.source_loss_diagnostics import select_source_samples, diagnose_source_losses
@@ -312,6 +326,10 @@ if __name__ == '__main__':
         "--diagnose_source_losses", action="store_true",
         help="Diagnose classification/segmentation loss tradeoffs on source data only; no training",
     )
+    parser.add_argument('--diagnose_prompt_contribution', action='store_true',
+                        help='Read-only source diagnostic of visual prompt Value contribution; no training')
+    parser.add_argument('--contribution_reference_report', default=None,
+                        help='Existing direct_gate_pilot.json; reuse its exact validation image identities')
     parser.add_argument(
         "--compare_loss_shapes", action="store_true",
         help="Also compute batch-preserving loss from identical predictions; source diagnostic only",
