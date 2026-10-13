@@ -163,11 +163,16 @@ class AdaCLIP_Trainer(nn.Module):
         has_shared_gate = any(
             "shared_gate_generator" in name for name in state_dict
         )
+        adapter = getattr(self.clip_model, 'spatial_channel_adapter', None)
+        if any('spatial_channel_adapter' in name for name in state_dict) and adapter is None:
+            raise ValueError('This checkpoint contains a feature adapter; specify --feature_adapter and its configuration')
         if has_shared_gate and self.fusion_mode != "shared_gate":
             raise ValueError(
                 "This checkpoint uses shared_gate; pass --fusion_mode shared_gate"
             )
         incompatible = self.load_state_dict(state_dict, strict=False)
+        if adapter is not None and any('spatial_channel_adapter' in name for name in incompatible.missing_keys):
+            raise ValueError('Checkpoint is missing feature adapter weights')
         if self.fusion_mode == "shared_gate":
             missing_gate = [
                 name for name in incompatible.missing_keys

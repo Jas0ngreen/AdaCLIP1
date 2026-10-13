@@ -708,6 +708,10 @@ class AdaCLIP(nn.Module):
 
         # for patch tokens
         proj_patch_tokens = self.patch_token_layer(patch_tokens)
+        adapter = getattr(self, 'spatial_channel_adapter', None)
+        if adapter is not None:
+            index = self.adapter_layer_index
+            proj_patch_tokens[index] = adapter(proj_patch_tokens[index])
         for layer in range(len(proj_patch_tokens)):
             # proj_patch_tokens[layer] /= proj_patch_tokens[layer].norm(dim=-1, keepdim=True)
             proj_patch_tokens[layer] = proj_patch_tokens[layer] / proj_patch_tokens[layer].norm(dim=-1, keepdim=True)

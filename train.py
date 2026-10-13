@@ -46,6 +46,11 @@ def validate_gate_resume(args):
 
 
 def train(args):
+    if getattr(args, 'spatial_channel_pilot', False):
+        from tools.spatial_channel_pilot import run_pilot
+        return run_pilot(args, get_data, AdaCLIP_Trainer, Logger, setup_seed)
+    if getattr(args, 'adapter_baseline', '') or getattr(args, 'adapter_reference_report', ''):
+        raise ValueError('Adapter initialization arguments require --spatial_channel_pilot')
     validate_gate_resume(args)
     from_baseline = bool(getattr(args, 'gate_from_baseline', ''))
     direct_pilot = getattr(args, 'direct_gate_pilot', False)
@@ -378,6 +383,13 @@ if __name__ == '__main__':
     parser.add_argument("--pilot_train_per_group", type=int, default=8)
     parser.add_argument("--pilot_val_per_group", type=int, default=2)
     parser.add_argument("--pilot_split_seed", type=int, default=111)
+    parser.add_argument('--spatial_channel_pilot', action='store_true',
+                        help='One source-only epoch each: spatial/channel attention vs additional dense gate')
+    parser.add_argument('--adapter_baseline', default='', help='Original add baseline checkpoint')
+    parser.add_argument('--adapter_reference_report', default='', help='Previous direct_gate_pilot.json with both source subsets')
+    parser.add_argument('--adapter_layer', type=int, default=24)
+    parser.add_argument('--adapter_reduction', type=int, default=16)
+    parser.add_argument('--adapter_learning_rate', type=float, default=0.001)
     parser.add_argument(
         "--gate_from_baseline", type=str, default="",
         help="Import an add baseline and train only gates on source data; new save_path, no target evaluation",

@@ -22,6 +22,14 @@ setup_seed(111)
 
 def train(args):
     assert os.path.isfile(args.ckt_path), f"Please check the path of pre-trained model, {args.ckt_path} is not valid."
+    feature_adapter = getattr(args, 'feature_adapter', 'none')
+    if feature_adapter != 'none' and (args.fusion_mode != 'add' or args.load_baseline
+            or args.check_gate_equivalence or args.diagnose_prompt_scale or args.diagnose_source_losses
+            or getattr(args, 'diagnose_prompt_contribution', False) or args.gate_override is not None):
+        raise ValueError('Feature adapter evaluation requires add fusion and no baseline-import/other diagnostic flags')
+    if feature_adapter != 'none':
+        from method.spatial_channel import validate_adapter_checkpoint
+        validate_adapter_checkpoint(args)
     contribution = getattr(args, 'diagnose_prompt_contribution', False)
     if contribution:
         from tools.prompt_contribution_diagnostics import validate_args
@@ -77,6 +85,9 @@ def train(args):
     if contribution:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         logger = Logger(os.path.join(args.save_path, 'logs', 'source_prompt_contribution.txt'))
+    elif feature_adapter != 'none':
+        os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
+        logger = Logger(os.path.join(args.save_path, 'logs', f'{args.testing_data}_feature_{feature_adapter}.txt'))
     elif args.diagnose_source_losses:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         logger = Logger(os.path.join(args.save_path, 'logs', diagnostic_name + '.txt'))
@@ -123,7 +134,11 @@ def train(args):
         fusion_mode=args.fusion_mode,
     ).to(device)
 
-    if args.load_baseline:
+    if feature_adapter != 'none':
+        from method.spatial_channel import configure_adapter
+        configure_adapter(model, feature_adapter, args.adapter_layer, args.adapter_reduction)
+        model.load(args.ckt_path, require_complete=True)
+    elif args.load_baseline:
         count = model.load_baseline_for_shared_gate(args.ckt_path)
         logger.info(f'Baseline import PASS: {count} detector tensors copied exactly; gate is untrained.')
     else:
@@ -166,6 +181,8 @@ def train(args):
         csv_root = os.path.join(save_root, 'csvs')
         image_root = os.path.join(save_root, 'images')
         suffix = ''
+        if feature_adapter != 'none':
+            suffix = f'_feature_{feature_adapter}_L{args.adapter_layer}_R{args.adapter_reduction}'
         if args.fusion_mode == "shared_gate":
             gate_label = (
                 "learned" if args.gate_override is None
@@ -318,6 +335,9 @@ if __name__ == '__main__':
         "--load_baseline", action="store_true",
         help="Explicitly import an add checkpoint into shared_gate (requires a fixed gate for evaluation)",
     )
+    parser.add_argument('--feature_adapter', choices=['none', 'attention', 'gated'], default='none')
+    parser.add_argument('--adapter_layer', type=int, default=24)
+    parser.add_argument('--adapter_reduction', type=int, default=16)
     parser.add_argument(
         "--check_gate_equivalence", action="store_true",
         help="Compare add and shared_gate=1 outputs on representative images, then exit without training",

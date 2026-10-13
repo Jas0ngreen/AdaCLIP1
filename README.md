@@ -115,6 +115,84 @@ Since we have utilized half-precision (FP16) for training, the training process 
 It is recommended to run the training process multiple times and choose the best model based on performance
 on the validation set as the final model.
 
+### Spatial/channel feature adaptation pilot (HEPE++-inspired)
+
+This experiment uses the original add AdaCLIP detector and existing CLIP
+features only. It adapts the layer-24 patch projection before L2 normalization
+with `Y = X + eta * Ac * As * G * X`. Channel attention uses spatial average/max
+pooling and a shared two-layer 1x1 MLP. Spatial attention uses channel average/max
+pooling and a 7x7 convolution. The additional dense gate G uses two 1x1
+convolutions with ReLU/Sigmoid; the `attention` control omits G. This borrows
+HEPE++ Eq. (3)-(8); it is not its complete DINO/AFS/text-prompt system.
+
+The normal add path remains the default. Eta starts at zero, preserving original
+predictions at initialization; its gradient can update in the first step while
+attention/gate gradients are initially zero. The gate's last projection starts
+at zero (Sigmoid=0.5). The two trained variants use identical common attention
+weights initially, training image order and RNG seed. Only the selected adapter
+parameters enter fresh AdamW (weight decay 0); all original parameters have
+requires_grad=False and grad=None. Frozen saved detector tensors and backbone
+tensor version counters are checked after each run. Module calculations use FP32
+within the existing AMP forward and return the original feature dtype.
+
+Synchronize changed `train.py`, `test.py`, `method/adaclip.py`, and
+`method/trainer.py`, plus **two new runtime files**:
+`method/spatial_channel.py` and `tools/spatial_channel_pilot.py`.
+The pilot uses the existing `tools/gate_equivalence.py` RNG helpers.
+
+Run from the server repository root after pulling the `hepe++` branch:
+
+```bash
+python train.py \
+  --spatial_channel_pilot --fusion_mode add \
+  --adapter_baseline ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --adapter_reference_report ./workspaces/baseline_gate_111_direct_pilot/diagnostics/direct_gate_pilot.json \
+  --training_data mvtec colondb \
+  --epoch 1 --batch_size 1 --seed 111 \
+  --adapter_layer 24 --adapter_reduction 16 --adapter_learning_rate 0.001 \
+  --save_path ./workspaces/hepe_sc_111_pilot
+```
+
+This loads exact train AND validation image paths/classes/labels from the previous
+pilot report (248/62 in the existing experiment). Missing records, overlaps,
+configuration mismatches, an incorrect baseline tensor set, or a nonempty output
+directory abort. No augmentation, target loading or automatic checkpoint
+selection. Existing source images are held out from this fit only, not unseen
+by the original baseline. Image/checkpoint contents are not hashed.
+
+One command checks initial equivalence on one validation image, trains
+`attention` for one epoch, trains `gated` for one epoch, then compares both fixed
+final models with the original detector on source validation using paired RNG
+(including HSF), aggregation=False and identical batch-preserving Focal/Dice
+loss. The report includes losses by class/label, adapter parameter counts,
+learned eta/gate statistics and actual post-L2 feature changes. The gated model
+has extra parameters: this is not a parameter-matched control, and sampled loss
+improvements alone do not establish AUROC/AP gains or target generalization.
+
+Completion: `Spatial-channel pilot: DONE`. Send:
+
+- `workspaces/hepe_sc_111_pilot/diagnostics/spatial_channel_pilot.json`
+- `workspaces/hepe_sc_111_pilot/logs/spatial_channel_pilot.txt`
+
+Other outputs: `diagnostics/source_split.json`, `models/attention_final.pth` and
+`models/gated_final.pth`, each checkpoint with an adjacent `.json` configuration.
+Saved weights include the exact baseline detector tensors plus the trained
+adapter. Keep the configuration JSON with the checkpoint. Target evaluation is
+a separate later step; if warranted, use the matching mode and configuration:
+
+```bash
+python test.py --fusion_mode add --feature_adapter gated \
+  --adapter_layer 24 --adapter_reduction 16 \
+  --ckt_path ./workspaces/hepe_sc_111_pilot/models/gated_final.pth \
+  --testing_data visa --batch_size 1 \
+  --save_path ./workspaces/hepe_sc_111_gated_eval
+```
+
+Evaluation verifies the adjacent JSON (including layer, mode and preprocessing),
+loads the full saved detector/adapter tensor set, and gives CSVs distinct
+`_feature_gated_L24_R16` / `_feature_attention_L24_R16` suffixes. An adapter
+checkpoint cannot silently load into a model without the adapter enabled.
+
 ### Shared gate experiment
 
 #### Source classification/localization loss diagnosis (no training)
