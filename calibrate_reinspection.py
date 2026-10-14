@@ -36,6 +36,20 @@ def accepts(row, rule):
     return row['evidence'][rule['feature']] >= rule['threshold']
 
 
+def match_initial_acceptance(rows, consistency_rule):
+    """Match MVTec CALIBRATION coverage, without validation or outcome input."""
+    rows = [r for r in rows if r['source'] == 'mvtec']
+    target = sum(accepts(r, consistency_rule) for r in rows)
+    scores = sorted({r['evidence']['baseline_core_mean'] for r in rows if r['evidence']['valid']})
+    choices = [{'kind': 'reject_all', 'feature': 'baseline_core_mean'},
+               {'kind': 'accept_all', 'feature': 'baseline_core_mean'}]
+    choices.extend({'kind': 'threshold', 'feature': 'baseline_core_mean', 'threshold': float(s)} for s in scores)
+    counts = [sum(accepts(r, rule) for r in rows) for rule in choices]
+    index = min(range(len(choices)), key=lambda i: (abs(counts[i] - target), counts[i]))
+    return {'selected_rule': choices[index], 'calibration_target_count': target,
+            'calibration_matched_count': counts[index], 'calibration_images': len(rows)}
+
+
 def policy_summary(rows, probabilities, candidate='two_crop_fixed_fusion'):
     """Probabilities allow an exact random-acceptance expectation, without fitting."""
     if len(rows) != len(probabilities):
