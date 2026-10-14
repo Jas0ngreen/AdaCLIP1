@@ -194,6 +194,27 @@ def main(args):
             or not 0 <= args.border_fraction < .2):
         raise ValueError('Require crop in (0,1), shift in (0,crop/4), border in [0,.2)')
     baseline, reference, out, reference_data = validate(args)
+    split = getattr(args, 'split', 'validation')
+    validation_report = getattr(args, 'calibrate_against', None)
+    if split not in ('train', 'validation'):
+        raise ValueError('split must be train or validation')
+    if validation_report:
+        if split != 'train' or not Path(validation_report).is_file():
+            raise ValueError('--calibrate_against requires --split train and an existing validation report')
+        # Fail early on a wrong/missing validation experiment, before GPU work.
+        from calibrate_reinspection import validate_report
+        prior = json.loads(Path(validation_report).read_text(encoding='utf8'))
+        validate_report(prior, reference_data['validation']['per_image'], 'validation')
+        if prior['metadata'].get('split', 'validation') != 'validation':
+            raise ValueError('--calibrate_against must point to the original validation diagnostic')
+        expected = {**{k: reference_data['metadata'][k] for k in CONFIG_KEYS},
+                    'seed': args.seed, 'crop_fraction': args.crop_fraction,
+                    'shift_fraction': args.shift_fraction, 'border_fraction': args.border_fraction}
+        for key, value in expected.items():
+            if prior['metadata'].get(key) != value:
+                raise ValueError('Validation report configuration mismatch: ' + key)
+        if prior['metadata']['baseline_sha256'] != hashlib.sha256(baseline.read_bytes()).hexdigest():
+            raise ValueError('Validation report uses different baseline checkpoint contents')
     from dataset import get_data
     from method import AdaCLIP_Trainer
     from tools import Logger, setup_seed
@@ -226,6 +247,7 @@ def main(args):
         'baseline_checkpoint': str(baseline), 'reference_report': str(reference),
         'baseline_sha256': hashlib.sha256(baseline.read_bytes()).hexdigest(),
         'seed': args.seed, 'crop_fraction': args.crop_fraction, 'shift_fraction': args.shift_fraction,
+        'split': split, 'sample_count': len(manifest[split]),
         'border_fraction': args.border_fraction, 'sources': meta['sources'],
         'candidate_selector': 'argmax of initial map smoothed with sigma4; no GT/label input',
         'prompts': 'hold BOTH visual/text dynamic prompts from full image',
@@ -260,7 +282,8 @@ def main(args):
             raise RuntimeError('Non-finite forward output')
         return amap[0].float().cpu().numpy(), margin, time.perf_counter() - start
 
-    for source, loader in loaders['validation']:
+    logger.info('Selected split=%s images=%d; augmentation off.' % (split, len(manifest[split])))
+    for source, loader in loaders[split]:
         for items in loader:
             setup_seed(args.seed + len(result['per_image']))
             rng = _rng_state()
@@ -322,14 +345,19 @@ def main(args):
                 stem, row['anomaly'], evidence['valid'], evidence['soft_iou'], evidence['contrast_min'],
                 row['outcomes']['two_crop_ap_delta'], row['outcomes']['two_crop_background_delta']))
             output.write_text(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf8')
-    if len(result['per_image']) != len(manifest['validation']):
-        raise RuntimeError('Validation identity count mismatch')
+    if len(result['per_image']) != len(manifest[split]):
+        raise RuntimeError('Selected split identity count mismatch')
     result['unchanged_detector_tensors'] = frozen_guard(trainer, before, versions)
     result['by_source'] = {source: rank_analysis([r for r in result['per_image'] if r['source'] == source])
                            for source in meta['sources']}
     result['status'] = 'complete'
     output.write_text(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf8')
     logger.info('Source reinspection reliability DONE; frozen detector PASS; report=' + str(output))
+    if validation_report:
+        from calibrate_reinspection import run_calibration
+        run_calibration(output, validation_report, reference, out / 'policy_comparison')
+        logger.info('Reinspection calibration DONE; rules fixed from train subset; validation comparison=' +
+                    str(out / 'policy_comparison' / 'validation_policy_comparison.json'))
 
 
 if __name__ == '__main__':
@@ -341,4 +369,6 @@ if __name__ == '__main__':
     parser.add_argument('--shift_fraction', type=float, default=.05)
     parser.add_argument('--border_fraction', type=float, default=.1)
     parser.add_argument('--seed', type=int, default=111)
+    parser.add_argument('--split', choices=('train', 'validation'), default='validation')
+    parser.add_argument('--calibrate_against', help='After train-split inference, calibrate and compare against this existing validation JSON')
     main(parser.parse_args())
