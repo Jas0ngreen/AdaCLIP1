@@ -31,8 +31,15 @@ def centered_box(cx, cy, width, height, image_width, image_height):
 
 def select_windows(baseline, native_size, crop_fraction=.5, shift_fraction=.05):
     """Same deterministic prediction-only selector for ALL images."""
-    h, w = baseline.shape
     py, px = np.unravel_index(np.argmax(gaussian_filter(baseline, sigma=4)), baseline.shape)
+    return windows_at_grid_anchor((int(px), int(py)), baseline.shape, native_size,
+                                  crop_fraction, shift_fraction)
+
+
+def windows_at_grid_anchor(anchor, grid_size, native_size, crop_fraction=.5, shift_fraction=.05):
+    """Shared pair geometry, independent of why an anchor was selected."""
+    px, py = anchor
+    h, w = grid_size
     nw, nh = native_size
     cx, cy = (px + .5) * nw / w, (py + .5) * nh / h
     bw, bh = max(2, round(nw * crop_fraction)), max(2, round(nh * crop_fraction))
