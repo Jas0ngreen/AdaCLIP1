@@ -74,11 +74,20 @@ def align_view(values, box, native_size, grid_size, border_fraction=.1):
     tensor = torch.from_numpy(np.asarray(values, dtype=np.float32).copy())[None, None]
     aligned = F.grid_sample(tensor, coords, mode='bilinear', padding_mode='border',
                             align_corners=False)[0, 0].numpy()
+    return aligned, view_support(box, native_size, grid_size, border_fraction)
+
+
+def view_support(box, native_size, grid_size, border_fraction=.1):
+    """Prediction-independent validity mask; no second crop forward is needed."""
+    nw, nh = native_size
+    gh, gw = grid_size
+    x0, y0, x1, y1 = box
+    x = (np.arange(gw, dtype=np.float32) + .5) * nw / gw
+    y = (np.arange(gh, dtype=np.float32) + .5) * nh / gh
     bx, by = border_fraction * (x1 - x0), border_fraction * (y1 - y0)
     lo_x, hi_x = x0 + (bx if x0 > 0 else 0), x1 - (bx if x1 < nw else 0)
     lo_y, hi_y = y0 + (by if y0 > 0 else 0), y1 - (by if y1 < nh else 0)
-    valid = (x[None, :] >= lo_x) & (x[None, :] < hi_x) & (y[:, None] >= lo_y) & (y[:, None] < hi_y)
-    return aligned, valid
+    return (x[None, :] >= lo_x) & (x[None, :] < hi_x) & (y[:, None] >= lo_y) & (y[:, None] < hi_y)
 
 
 @contextmanager

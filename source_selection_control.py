@@ -1,6 +1,7 @@
 """Source-only matched-budget crop-selection ablation. No training or gating.
 
-All variants use two equal-size shifted crops and the existing fixed 0.5 fusion.
+Default selector variants use two equal-size crops and fixed 0.5 fusion.
+Crop-count/standalone helpers retain that geometry for single-A controls.
 Random seeds are independent repetitions, never an ensemble or best-seed search.
 Metrics are per-image diagnostics, not category-pooled target benchmark scores.
 """
@@ -18,7 +19,7 @@ import torch
 
 from source_crop_pilot import CONFIG_KEYS, capture_prompts, reuse_prompts, region_metrics, validate
 from source_reinspection_reliability import (
-    select_windows, windows_at_grid_anchor, align_view, evidence_statistics, candidate_updates)
+    select_windows, windows_at_grid_anchor, align_view, view_support, evidence_statistics, candidate_updates)
 
 
 METRICS = ('pixel_ap', 'pixel_auroc', 'background_mean', 'background_q99')
@@ -58,6 +59,67 @@ def inspect_crop_count(trainer, image, cls_name, original, config, identity, ran
     """
     return _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds,
                           rng_tools, check, crop_count=True)
+
+
+def inspect_standalone(trainer, image, cls_name, original, config, mode, rng_tools):
+    """One independent inference: global only, global+A, or global+A+B.
+
+    No other variant's prediction is computed or reused. The single route uses
+    the original dual-box INTERSECTION geometry, but never infers crop B.
+    No per-forward synchronization or component timers: callers time the whole
+    path with CUDA synchronization at its outer boundaries.
+    """
+    if mode not in ('baseline', 'single_a', 'adaptive'):
+        raise ValueError('Unknown standalone mode: ' + mode)
+    capture_rng, restore_rng = rng_tools
+    initial_rng = capture_rng()
+    clip, calls = trainer.clip_model, 0
+
+    def forward(tensor):
+        nonlocal calls
+        restore_rng(initial_rng)
+        with torch.no_grad():
+            amap, score = clip(tensor.to(trainer.device), cls_name, aggregation=True)
+        calls += 1
+        if not torch.isfinite(amap).all() or not torch.isfinite(score).all():
+            raise RuntimeError('Non-finite standalone prediction')
+        values = amap[0].float().cpu().numpy()
+        if values.ndim != 2 or np.min(values) < 0 or np.max(values) > 1:
+            raise ValueError('Expected a 2D probability map')
+        return values, float(score[0])
+
+    base, score = forward(image)
+    after_baseline_rng = capture_rng()
+    try:
+        if mode == 'baseline':
+            return dict(map=gaussian_filter(base, sigma=4), image_score=score, model_calls=calls)
+        prompts = capture_prompts(clip)
+        selection = select_windows(base, original.size, config['crop_fraction'], config['shift_fraction'])
+        # Geometries, not crop predictions, define the exact previous support.
+        a, b = selection['boxes_native']
+        common = (view_support(a, original.size, base.shape, config['border_fraction']) &
+                  view_support(b, original.size, base.shape, config['border_fraction']))
+        if not selection['distinct_windows']:
+            common[:] = False
+        z = np.zeros_like(base)
+        evidence = evidence_statistics(base, z, z, z, z, common, selection['peak_xy_grid'])
+        support = common if evidence['valid'] else np.zeros_like(common)
+        views = []
+        # Always execute the declared budget, even for invalid geometry; no
+        # unvalidated early-exit speedup is mixed into this latency comparison.
+        for box in selection['boxes_native'][:1 if mode == 'single_a' else 2]:
+            crop = trainer.preprocess(original.crop(box)).unsqueeze(0)
+            with reuse_prompts(clip, prompts):
+                values, _ = forward(crop)
+            aligned, _ = align_view(values, box, original.size, base.shape, config['border_fraction'])
+            views.append(aligned)
+        proposal = views[0] if mode == 'single_a' else (views[0] + views[1]) / 2
+        fused = base.copy()
+        fused[support] = .5 * base[support] + .5 * proposal[support]
+        return dict(map=gaussian_filter(fused, sigma=4), image_score=score, model_calls=calls,
+                    support=support, geometry_valid=bool(evidence['valid']), selection=selection)
+    finally:
+        restore_rng(after_baseline_rng)
 
 
 def _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check, crop_count):
