@@ -2,6 +2,7 @@
 
 Default selector variants use two equal-size crops and fixed 0.5 fusion.
 Crop-count/standalone helpers retain that geometry for single-A controls.
+--single_crop_ablation compares all selectors using only their first crop.
 Random seeds are independent repetitions, never an ensemble or best-seed search.
 Metrics are per-image diagnostics, not category-pooled target benchmark scores.
 """
@@ -59,6 +60,12 @@ def inspect_crop_count(trainer, image, cls_name, original, config, identity, ran
     """
     return _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds,
                           rng_tools, check, crop_count=True)
+
+
+def inspect_single_selection(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check=False):
+    """One crop A per selector; B contributes geometry only, never predictions."""
+    return _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds,
+                          rng_tools, check, crop_count=False, single_selection=True)
 
 
 def inspect_standalone(trainer, image, cls_name, original, config, mode, rng_tools):
@@ -122,7 +129,8 @@ def inspect_standalone(trainer, image, cls_name, original, config, mode, rng_too
         restore_rng(after_baseline_rng)
 
 
-def _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check, crop_count):
+def _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check, crop_count,
+                   single_selection=False):
     capture_rng, restore_rng = rng_tools
     rng = capture_rng()
     device, clip = trainer.device, trainer.clip_model
@@ -160,7 +168,7 @@ def _inspect_image(trainer, image, cls_name, original, config, identity, random_
         maps, supports, records = {'baseline': gaussian_filter(base, sigma=4)}, {}, {}
         for mode, selection in choices.items():
             views, valid_masks, times = [], [], []
-            for box in selection['boxes_native']:
+            for box in selection['boxes_native'][:1 if single_selection else 2]:
                 crop = trainer.preprocess(original.crop(box)).unsqueeze(0)
                 with reuse_prompts(clip, prompts):
                     values, _, elapsed = forward(crop)
@@ -168,17 +176,24 @@ def _inspect_image(trainer, image, cls_name, original, config, identity, random_
                 views.append(aligned)
                 valid_masks.append(valid)
                 times.append(elapsed)
+            if single_selection:
+                valid_masks.append(view_support(selection['boxes_native'][1], original.size, base.shape,
+                                                config['border_fraction']))
             common = valid_masks[0] & valid_masks[1]
             if not selection['distinct_windows']:
                 common[:] = False
             z = np.zeros_like(base)
             # Identical geometry-only safety test for each selector's OWN anchor.
             # Neither soft_iou nor anomaly confidence decides whether to update.
-            evidence = (evidence_statistics(base, z, z, z, z, common, selection['peak_xy_grid']) if crop_count else
+            evidence = (evidence_statistics(base, z, z, z, z, common, selection['peak_xy_grid']) if crop_count or single_selection else
                         evidence_statistics(base, *views, z, z, common, selection['peak_xy_grid']))
             support = common if evidence['valid'] else np.zeros_like(common)
-            updates = candidate_updates(base, *views, support, weight=.5)
-            fused = updates['two_crop_fixed_fusion']
+            if single_selection:
+                fused = base.copy()
+                fused[support] = .5 * base[support] + .5 * views[0][support]
+            else:
+                updates = candidate_updates(base, *views, support, weight=.5)
+                fused = updates['two_crop_fixed_fusion']
             maps[mode] = gaussian_filter(fused, sigma=4)
             supports[mode] = support
             records[mode] = dict(anchor_xy_grid=selection['peak_xy_grid'],
@@ -187,6 +202,9 @@ def _inspect_image(trainer, image, cls_name, original, config, identity, random_
                 geometry_valid=bool(evidence['valid']), shared_pixels=int(common.sum()),
                 update_pixels=int(support.sum()), update_fraction=float(support.mean()),
                 crop_seconds=times)
+            if single_selection:
+                records[mode].update(forward_box_native=selection['boxes_native'][0],
+                    crop_forwards=1, matched_support_uses_both_box_geometries=True)
             if crop_count:
                 single_b = base.copy()
                 single_b[support] = .5 * base[support] + .5 * views[1][support]
@@ -273,8 +291,63 @@ def prepare(args):
     return source_path, source, baseline, reference, out, reference_data
 
 
+def single_source_reference(source, reference, split, root):
+    """Require the original source raw caches for the selected split, in order.
+
+    Legacy validation reports omit `split`; validate their identities instead.
+    Ordered identities matter because the pilot seeds each image by its index.
+    """
+    from audit_reinspection_risk import safe_child
+
+    if source['metadata'].get('split', split) != split:
+        raise ValueError('Single selection requires source_report for the selected split')
+    expected = [(name, str(Path(r['image']).resolve()), r['class'], r['anomaly'])
+                for name in source['metadata']['sources']
+                for r in reference[split]['per_image'] if r['source'] == name]
+    rows = source.get('per_image', [])
+    actual = [(r['source'], str(Path(r['image']).resolve()), r['class'], r['anomaly']) for r in rows]
+    if not rows or actual != expected:
+        raise ValueError('Single selection source_report identities/order must match selected split')
+    for row in rows:
+        safe_child(root, row['cache'])
+    return rows
+
+
+def check_single_source_reference(prediction, mask, row, root, guard):
+    """Replay only cached baseline/A; no crop B inference or fitting is added."""
+    from audit_reinspection_risk import safe_child
+
+    with np.load(safe_child(root, row['cache']), allow_pickle=False) as cache:
+        base, crop = cache['baseline'], cache['crop_a']
+        support, gt = cache['update_support'], cache['gt_mask']
+        shape = prediction['maps']['baseline'].shape
+        if (any(a.shape != shape for a in (base, crop, support, gt))
+                or support.dtype != np.bool_ or gt.dtype != np.bool_
+                or any(not np.isfinite(a).all() or np.min(a) < 0 or np.max(a) > 1 for a in (base, crop))):
+            raise ValueError('Invalid source raw cache shape/dtype/probability')
+        record = prediction['selections']['adaptive']
+        if (not np.array_equal(mask, gt) or not np.array_equal(prediction['supports']['adaptive'], support)
+                or record['boxes_native'] != row['boxes_native']
+                or record['anchor_xy_grid'] != row['peak_xy_grid']
+                or record['geometry_valid'] != bool(row['evidence']['valid'])):
+            raise RuntimeError('Source single selection GT/geometry equivalence failed: ' + row['image'])
+        single = base.copy()
+        single[support] = .5 * base[support] + .5 * crop[support]
+        for mode, values in (('baseline', base), ('adaptive', single)):
+            expected = gaussian_filter(values, sigma=4)
+            actual = prediction['maps'][mode]
+            if not np.allclose(actual, expected, atol=1e-6, rtol=1e-5):
+                raise RuntimeError('Source single selection %s map equivalence failed: %s' % (mode, row['image']))
+            key = mode + '_max_map_delta'
+            guard[key] = max(guard[key], float(np.abs(actual - expected).max()))
+    guard['checked_images'] += 1
+
+
 def main(args):
     source_path, source, baseline, reference, out, reference_data = prepare(args)
+    single_selection = getattr(args, 'single_crop_ablation', False)
+    prior_rows = (single_source_reference(source, reference_data, args.split, source_path.parent)
+                  if single_selection else None)
     from dataset import get_data
     from method import AdaCLIP_Trainer
     from tools import Logger, setup_seed
@@ -300,7 +373,9 @@ def main(args):
     loaders, manifest = make_loaders(trainer, args, reference_data, get_data)
     out.mkdir(parents=True, exist_ok=True)
     (out / 'cache').mkdir()
-    logger = Logger(str(out / 'source_selection_control.txt'))
+    run_name = 'source_single_selection_control' if single_selection else 'source_selection_control'
+    crop_count = 1 if single_selection else 2
+    logger = Logger(str(out / (run_name + '.txt')))
     modes = ['baseline', 'adaptive', 'fixed_center'] + ['random_%d' % s for s in args.random_seeds]
     report = dict(status='running', metadata=dict(
         source_report=str(source_path), source_report_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
@@ -308,7 +383,7 @@ def main(args):
         detector_config={k: meta[k] for k in CONFIG_KEYS}, baseline_checkpoint=str(baseline),
         baseline_sha256=meta['baseline_sha256'], split=args.split, seed=args.seed,
         crop_fraction=meta['crop_fraction'], shift_fraction=meta['shift_fraction'], border_fraction=meta['border_fraction'],
-        fusion_weight=.5, random_seeds=args.random_seeds, crops_per_variant=2,
+        fusion_weight=.5, random_seeds=args.random_seeds, crops_per_variant=crop_count,
         candidate_selectors='adaptive sigma4 argmax; fixed central grid pixel; uniform random grid pixel',
         random_identity='SHA256(seed:source:absolute_image_path), first 32 bits -> numpy RandomState',
         no_score_gate=True, geometry_safety='distinct shifted crops; own anchor/core/ring covered by common support',
@@ -316,23 +391,44 @@ def main(args):
         metric_units='0..1; per-image grid metrics, sigma4 once after fusion',
         random_mean='mean of per-image metrics across seeds; NOT AP of averaged maps or an ensemble',
         source_experiment_not_unseen_target_test=True, no_training=True, no_target_evaluation=True,
-        no_threshold_tuning=True, per_image_model_calls_excluding_initial_check=1 + 2 * (len(modes) - 1)),
+        no_threshold_tuning=True, per_image_model_calls_excluding_initial_check=1 + crop_count * (len(modes) - 1)),
         per_image=[])
-    report_path = out / 'source_selection_control.json'
-    logger.info('SOURCE SELECTION CONTROL: split=%s images=%d seeds=%s; 2 crop forwards per variant.' %
-                (args.split, len(manifest[args.split]), args.random_seeds))
+    if single_selection:
+        report['metadata'].update(experiment='matched_budget_single_crop_selection',
+            primary_view='A, fixed before evaluation; B geometry only',
+            support_policy='each selector uses its own dual-box common trimmed support and own-anchor safety; actual areas can differ',
+            geometry_validity_requires_second_crop_prediction=False, full_single_crop_support_evaluated=False,
+            background_alignment_used=False, no_best_seed_selection=True,
+            shared_run_timing_note='forward components only, not independent end-to-end latency')
+        report['reference_equivalence'] = dict(enabled=True, checked_images=0,
+            baseline_max_map_delta=0., adaptive_max_map_delta=0., atol=1e-6, rtol=1e-5,
+            image_score_reference_available=False)
+    report_path = out / (run_name + '.json')
+    logger.info('SOURCE SELECTION CONTROL: split=%s images=%d seeds=%s; %d crop forward(s) per variant.' %
+                (args.split, len(manifest[args.split]), args.random_seeds, crop_count))
     for source_name, loader in loaders[args.split]:
         for items in loader:
             setup_seed(args.seed + len(report['per_image']))
             identity = source_name + ':' + str(Path(items['img_path'][0]).resolve())
             with Image.open(items['img_path'][0]) as image:
                 original = image.convert('RGB')
-            prediction = inspect_image(trainer, items['img'], items['cls_name'], original, meta, identity,
-                                       args.random_seeds, (_rng_state, _restore_rng), check=not report['per_image'])
+            inspector = inspect_single_selection if single_selection else inspect_image
+            prediction = inspector(trainer, items['img'], items['cls_name'], original, meta, identity,
+                                   args.random_seeds, (_rng_state, _restore_rng), check=not report['per_image'])
             if not report['per_image']:
                 report['initial_equivalence'] = prediction['initial_equivalence']
             # Labels/masks are consumed ONLY after every selection and forward.
             mask = items['img_mask'][0, 0].numpy() > .5
+            if single_selection:
+                index = len(report['per_image'])
+                if index >= len(prior_rows):
+                    raise RuntimeError('More source samples than the reference')
+                prior = prior_rows[index]
+                if (source_name != prior['source'] or items['cls_name'][0] != prior['class']
+                        or str(Path(items['img_path'][0]).resolve()) != str(Path(prior['image']).resolve())
+                        or int(items['anomaly'][0]) != prior['anomaly']):
+                    raise RuntimeError('Source single selection identity/order differs from reference')
+                check_single_source_reference(prediction, mask, prior, source_path.parent, report['reference_equivalence'])
             metrics = {mode: region_metrics(mask, values) for mode, values in prediction['maps'].items()}
             metrics['random_mean'] = {key: average([metrics['random_%d' % s][key] for s in args.random_seeds
                                          if metrics['random_%d' % s][key] is not None]) for key in metrics['baseline']}
@@ -354,6 +450,11 @@ def main(args):
     if len(actual) != len(expected) or set(actual) != expected:
         raise RuntimeError('Selected split identity mismatch')
     report['unchanged_detector_tensors'] = frozen_guard(trainer, before, versions)
+    if single_selection:
+        guard = report['reference_equivalence']
+        if guard['checked_images'] != len(prior_rows):
+            raise RuntimeError('Missing source reference samples')
+        guard['passed'] = True
     all_modes = modes + ['random_mean']
     report['by_source'] = {name: summarize([r for r in report['per_image'] if r['source'] == name], all_modes)
                            for name in meta['sources']}
@@ -363,7 +464,8 @@ def main(args):
     report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf8')
     for name, summary in report['by_source'].items():
         logger.info(name + ' class-balanced per-image metrics: ' + json.dumps(summary, allow_nan=False))
-    logger.info('Source selection control DONE; frozen detector PASS; report=' + str(report_path))
+    logger.info(('Source single selection control DONE' if single_selection else 'Source selection control DONE') +
+                '; frozen detector PASS; report=' + str(report_path))
 
 
 if __name__ == '__main__':
@@ -373,4 +475,6 @@ if __name__ == '__main__':
     parser.add_argument('--save_path', required=True)
     parser.add_argument('--split', choices=('train', 'validation'), default='validation')
     parser.add_argument('--random_seeds', nargs='+', type=int, default=[111, 222, 333])
+    parser.add_argument('--single_crop_ablation', action='store_true',
+                        help='One crop A per selector; source_report must match split AND its raw cache must remain available')
     main(parser.parse_args())
