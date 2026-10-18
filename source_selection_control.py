@@ -45,6 +45,22 @@ def selections(base, native_size, config, identity, random_seeds):
 
 def inspect_image(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check=False):
     """Selection/inference must finish before labels or GT enter the pipeline."""
+    return _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds,
+                          rng_tools, check, crop_count=False)
+
+
+def inspect_crop_count(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check=False):
+    """Matched-support single A/B vs dual; only the adaptive pair is inferred.
+
+    Both boxes define the SAME geometric support for all three variants. Their
+    safety check needs no crop-B prediction, even though this shared experiment
+    computes B to evaluate the dual variant. A is the prespecified single control.
+    """
+    return _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds,
+                          rng_tools, check, crop_count=True)
+
+
+def _inspect_image(trainer, image, cls_name, original, config, identity, random_seeds, rng_tools, check, crop_count):
     capture_rng, restore_rng = rng_tools
     rng = capture_rng()
     device, clip = trainer.device, trainer.clip_model
@@ -77,7 +93,8 @@ def inspect_image(trainer, image, cls_name, original, config, identity, random_s
                 raise RuntimeError('Full-image held-prompt equivalence failed')
             equivalence = dict(passed=True, max_map_delta=float(np.abs(base - held).max()),
                                score_delta=abs(score - held_score))
-        choices = selections(base, original.size, config, identity, random_seeds)
+        choices = ({'adaptive': select_windows(base, original.size, config['crop_fraction'], config['shift_fraction'])}
+                   if crop_count else selections(base, original.size, config, identity, random_seeds))
         maps, supports, records = {'baseline': gaussian_filter(base, sigma=4)}, {}, {}
         for mode, selection in choices.items():
             views, valid_masks, times = [], [], []
@@ -95,9 +112,11 @@ def inspect_image(trainer, image, cls_name, original, config, identity, random_s
             z = np.zeros_like(base)
             # Identical geometry-only safety test for each selector's OWN anchor.
             # Neither soft_iou nor anomaly confidence decides whether to update.
-            evidence = evidence_statistics(base, *views, z, z, common, selection['peak_xy_grid'])
+            evidence = (evidence_statistics(base, z, z, z, z, common, selection['peak_xy_grid']) if crop_count else
+                        evidence_statistics(base, *views, z, z, common, selection['peak_xy_grid']))
             support = common if evidence['valid'] else np.zeros_like(common)
-            fused = candidate_updates(base, *views, support, weight=.5)['two_crop_fixed_fusion']
+            updates = candidate_updates(base, *views, support, weight=.5)
+            fused = updates['two_crop_fixed_fusion']
             maps[mode] = gaussian_filter(fused, sigma=4)
             supports[mode] = support
             records[mode] = dict(anchor_xy_grid=selection['peak_xy_grid'],
@@ -106,6 +125,16 @@ def inspect_image(trainer, image, cls_name, original, config, identity, random_s
                 geometry_valid=bool(evidence['valid']), shared_pixels=int(common.sum()),
                 update_pixels=int(support.sum()), update_fraction=float(support.mean()),
                 crop_seconds=times)
+            if crop_count:
+                single_b = base.copy()
+                single_b[support] = .5 * base[support] + .5 * views[1][support]
+                for name, values, index in (('single_a', updates['single_crop_fixed_fusion'], 0),
+                                             ('single_b', single_b, 1)):
+                    maps[name] = gaussian_filter(values, sigma=4)
+                    supports[name] = support
+                    records[name] = {**records[mode], 'crop_seconds': [times[index]],
+                                     'forward_box_native': selection['boxes_native'][index],
+                                     'matched_support_uses_both_box_geometries': True}
         return dict(maps=maps, supports=supports, selections=records, image_score=score,
                     baseline_seconds=seconds, initial_equivalence=equivalence)
     finally:

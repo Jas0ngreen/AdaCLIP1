@@ -4,6 +4,8 @@ Reuse the source pilot's selectors, two-crop geometry, held prompts and 0.5 fusi
 Official category-pooled metrics are computed independently for each random seed;
 random_mean is the arithmetic mean of metrics, NOT a map/prediction ensemble.
 Optional previous evaluation caches provide a per-image equivalence guard.
+--crop_count_ablation instead compares adaptive single A, single B and dual,
+with identical support and no extra center/random forwards. Default unchanged.
 """
 import argparse
 import hashlib
@@ -18,7 +20,7 @@ import torch
 
 from audit_reinspection_risk import safe_child
 from calibrate_reinspection import CONFIG_KEYS
-from source_selection_control import inspect_image, prepare as prepare_source, average
+from source_selection_control import inspect_image, inspect_crop_count, prepare as prepare_source, average
 
 
 def prepare(args):
@@ -79,7 +81,7 @@ def check_reference(prediction, image, category, previous, guard):
     guard['checked_images'] += 1
 
 
-def pooled_metrics(masks, maps, labels, scores, calculate_px, calculate_im):
+def pooled_mode_metrics(masks, maps, labels, scores, calculate_px, calculate_im):
     """Pool pixels WITH normal images, then use the original official helpers."""
     ap_im, auroc_im, f1_im = calculate_im(labels, scores)
     result = {}
@@ -90,6 +92,12 @@ def pooled_metrics(masks, maps, labels, scores, calculate_px, calculate_im):
         if not all(math.isfinite(v) for v in record.values()):
             raise RuntimeError('Non-finite pooled metric')
         result[mode] = record
+    return result
+
+
+def pooled_metrics(masks, maps, labels, scores, calculate_px, calculate_im):
+    """Original selector-comparison API, including mandatory random controls."""
+    result = pooled_mode_metrics(masks, maps, labels, scores, calculate_px, calculate_im)
     randoms = [v for k, v in result.items() if k.startswith('random_')]
     if not randoms:
         raise ValueError('At least one random-seed control is required')
@@ -121,7 +129,11 @@ def main(args):
     from tools.spatial_channel_pilot import import_baseline, frozen_guard
 
     meta = source['metadata']
-    modes = ['baseline', 'adaptive', 'fixed_center'] + ['random_%d' % s for s in args.random_seeds]
+    crop_count = getattr(args, 'crop_count_ablation', False)
+    modes = (['baseline', 'single_a', 'single_b', 'adaptive'] if crop_count else
+             ['baseline', 'adaptive', 'fixed_center'] + ['random_%d' % s for s in args.random_seeds])
+    run_name = 'crop_count_eval' if crop_count else 'selection_control_eval'
+    csv_tag = 'crop_count' if crop_count else 'selection'
     protocol = dict(source_report=str(source_path), source_report_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
         source_config={k: meta[k] for k in CONFIG_KEYS}, baseline_checkpoint=str(baseline),
         testing_data=args.testing_data, random_seeds=args.random_seeds, crops_per_variant=2,
@@ -136,14 +148,29 @@ def main(args):
         per_image_model_calls_excluding_first_equivalence_check=1 + 2 * (len(modes) - 1),
         reference_eval=str(previous['path']) if previous else None,
         reference_eval_sha256=previous['sha256'] if previous else None)
+    if crop_count:
+        protocol.update(experiment='matched_support_crop_count_ablation',
+            crops_per_variant={'baseline': 0, 'single_a': 1, 'single_b': 1, 'adaptive': 2},
+            primary_single_control='single_a; first existing shifted window, fixed before target evaluation',
+            secondary_single_control='single_b; report all results, no best-view selection',
+            adaptive_definition='unchanged original dual-crop arithmetic mean',
+            support_policy='all three variants use the original dual-box common trimmed support and own-anchor geometry validity',
+            geometry_validity_requires_second_crop_prediction=False,
+            full_single_crop_support_evaluated=False,
+            background_alignment_used=False,
+            per_image_model_calls_excluding_first_equivalence_check=3,
+            shared_run_timing_note='isolated forward-component estimates only, not standalone end-to-end latency')
+        for key in ('random_seeds', 'random_identity', 'random_mean'):
+            protocol.pop(key)
     setup_seed(meta['seed'])
     config = json.loads((Path(__file__).parent / 'model_configs' / (meta['model'] + '.json')).read_text())
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     output.mkdir(parents=True, exist_ok=True)
     (output / 'cache').mkdir()
     (output / 'csvs').mkdir()
-    logger = Logger(str(output / 'selection_control_eval.txt'))
-    (output / 'fixed_selection_protocol.json').write_text(json.dumps(protocol, indent=2, allow_nan=False), encoding='utf8')
+    logger = Logger(str(output / (run_name + '.txt')))
+    (output / ('fixed_crop_count_protocol.json' if crop_count else 'fixed_selection_protocol.json')).write_text(
+        json.dumps(protocol, indent=2, allow_nan=False), encoding='utf8')
     logger.info('FIXED SELECTION PROTOCOL: ' + json.dumps(protocol, allow_nan=False))
     trainer = AdaCLIP_Trainer(backbone=meta['model'],
         feat_list=[config['vision_cfg']['layers'] // 4 * i for i in (1, 2, 3, 4)],
@@ -175,8 +202,10 @@ def main(args):
         raise ValueError('Reference target image identities/class counts differ')
     side = meta['image_size']
     disk_bytes = len(dataset) * side * side * (4 * len(modes) + 1)
-    logger.info('Target images=%d; map caches estimated %.2f GiB; two crops PER variant, random trials are separate.' %
-                (len(dataset), disk_bytes / 1024 ** 3))
+    logger.info('Target images=%d; map caches estimated %.2f GiB; %s' % (
+        len(dataset), disk_bytes / 1024 ** 3,
+        'shared global + A + B; primary single A fixed, identical update support.' if crop_count else
+        'two crops PER variant, random trials are separate.'))
     cache, class_rows = {}, {name: [] for name in classes}
     for i, name in enumerate(classes):
         cache[name] = {mode: np.lib.format.open_memmap(
@@ -187,14 +216,15 @@ def main(args):
                  max_image_score_delta=0., atol=1e-6, rtol=1e-5)
     report = dict(status='running', testing_data=args.testing_data, protocol=protocol, cache_estimated_bytes=disk_bytes,
                   per_image=[], metrics={}, reference_equivalence=guard)
-    report_path = output / 'selection_control_eval.json'
+    report_path = output / (run_name + '.json')
     loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
     start = time.perf_counter()
     for i, items in enumerate(loader):
         image_path, category = items['img_path'][0], items['cls_name'][0]
         with Image.open(image_path) as image:
             original = image.convert('RGB')
-        prediction = inspect_image(trainer, items['img'], items['cls_name'], original, meta,
+        inspector = inspect_crop_count if crop_count else inspect_image
+        prediction = inspector(trainer, items['img'], items['cls_name'], original, meta,
             args.testing_data + ':' + str(Path(image_path).resolve()), args.random_seeds,
             (_rng_state, _restore_rng), check=i == 0)
         if i == 0:
@@ -232,7 +262,7 @@ def main(args):
     report['inference_loop_seconds'] = time.perf_counter() - start
     report['unchanged_detector_tensors'] = frozen_guard(trainer, before, versions)
     guard['passed'] = guard['checked_images'] == len(dataset) if previous else None
-    all_modes = modes + ['random_mean']
+    all_modes = modes if crop_count else modes + ['random_mean']
     for name in classes:
         rows = class_rows[name]
         if len(rows) != counts[name]:
@@ -240,17 +270,19 @@ def main(args):
         for values in cache[name].values():
             values.flush()
         logger.info('Computing official category-pooled metrics: ' + name)
-        report['metrics'][name] = pooled_metrics(cache[name]['mask'], {mode: cache[name][mode] for mode in modes},
+        metric_function = pooled_mode_metrics if crop_count else pooled_metrics
+        report['metrics'][name] = metric_function(cache[name]['mask'], {mode: cache[name][mode] for mode in modes},
             np.asarray([r['anomaly'] for r in rows]), np.asarray([r['image_score'] for r in rows]),
             calculate_px_metrics, calculate_im_metrics)
         for mode, values in report['metrics'][name].items():
             write2csv(values, list(classes) + ['Average'], name,
-                      str(output / 'csvs' / ('%s_selection_%s.csv' % (args.testing_data, mode))))
+                      str(output / 'csvs' / ('%s_%s_%s.csv' % (args.testing_data, csv_tag, mode))))
         report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf8')
     report['average'] = {mode: calculate_average_metric({name: report['metrics'][name][mode] for name in classes})
                          for mode in all_modes}
-    report['random_seed_metric_std'] = {k: float(np.std([report['average']['random_%d' % s][k] for s in args.random_seeds]))
-                                        for k in report['average']['baseline']}
+    if not crop_count:
+        report['random_seed_metric_std'] = {k: float(np.std([report['average']['random_%d' % s][k] for s in args.random_seeds]))
+                                            for k in report['average']['baseline']}
     report['selection_summary'] = geometry_summary(report['per_image'], modes)
     report['selection_summary_by_class'] = {name: geometry_summary(rows, modes) for name, rows in class_rows.items()}
     normals = [r for r in report['per_image'] if r['anomaly'] == 0]
@@ -260,20 +292,35 @@ def main(args):
         for key in ('mean', 'q99')} for mode in modes}
     report['normal_response_note'] = 'Unthresholded response diagnostics on normal images, NOT false-positive rates.'
     base_seconds = sum(r['baseline_seconds'] for r in report['per_image'])
+    crop_time_key = 'crop_forward_seconds' if crop_count else 'two_crop_forward_seconds'
     report['timing'] = dict(baseline_forward_seconds=base_seconds,
-        variants={mode: dict(two_crop_forward_seconds=sum(sum(r['selections'][mode]['crop_seconds']) for r in report['per_image']))
+        variants={mode: {crop_time_key: sum(sum(r['selections'][mode]['crop_seconds']) for r in report['per_image'])}
                   for mode in modes if mode != 'baseline'},
         all_trials_computed_in_one_run=True, no_early_exit_or_compute_savings_claim=True)
     for values in report['timing']['variants'].values():
-        values['model_forward_ratio_vs_baseline'] = (base_seconds + values['two_crop_forward_seconds']) / base_seconds if base_seconds else None
+        values['model_forward_ratio_vs_baseline'] = (base_seconds + values[crop_time_key]) / base_seconds if base_seconds else None
+    if crop_count:
+        report['timing'].update(isolated_end_to_end_latency_measured=False,
+            forward_components_reused_from_shared_run=True,
+            actual_model_calls_excluding_first_equivalence_check=len(dataset) * 3)
+        report['comparisons'] = {}
+        for single in ('single_a', 'single_b'):
+            report['comparisons']['dual_vs_' + single] = dict(
+                average_metric_delta={k: report['average']['adaptive'][k] - report['average'][single][k]
+                                      for k in report['average']['adaptive']},
+                per_class_metric_delta={name: {k: v['adaptive'][k] - v[single][k] for k in v['adaptive']}
+                                        for name, v in report['metrics'].items()},
+                additional_crop_forward_seconds=report['timing']['variants']['adaptive'][crop_time_key]
+                                                - report['timing']['variants'][single][crop_time_key])
     for mode, values in report['average'].items():
         write2csv(values, list(classes) + ['Average'], 'Average',
-                  str(output / 'csvs' / ('%s_selection_%s.csv' % (args.testing_data, mode))))
+                  str(output / 'csvs' / ('%s_%s_%s.csv' % (args.testing_data, csv_tag, mode))))
         logger.info('%s Average I-Auroc:%.2f I-F1:%.2f I-AP:%.2f P-Auroc:%.2f P-F1:%.2f P-AP:%.2f' %
                     (mode, values['auroc_im'], values['f1_im'], values['ap_im'], values['auroc_px'], values['f1_px'], values['ap_px']))
     report['status'] = 'complete'
     report_path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf8')
-    logger.info('Selection control target evaluation DONE; frozen detector PASS; reference equivalence=' + str(guard['passed']))
+    logger.info(('Crop count target evaluation DONE' if crop_count else 'Selection control target evaluation DONE') +
+                '; frozen detector PASS; reference equivalence=' + str(guard['passed']))
 
 
 if __name__ == '__main__':
@@ -283,5 +330,7 @@ if __name__ == '__main__':
     parser.add_argument('--reference_eval', help='Previous reinspection_eval.json AND its cache directory must remain available')
     parser.add_argument('--testing_data', choices=('mpdd', 'visa', 'btad'), default='mpdd')
     parser.add_argument('--random_seeds', nargs='+', type=int, default=[111, 222, 333])
+    parser.add_argument('--crop_count_ablation', action='store_true',
+                        help='Single A/B vs unchanged dual, matched support; ignores random_seeds; no center/random inference')
     parser.add_argument('--save_path', required=True)
     main(parser.parse_args())
