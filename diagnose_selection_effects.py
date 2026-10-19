@@ -63,7 +63,7 @@ def compare_images(rows, left, right):
         normal_q99_response=changes(deltas(normal, 'q99'), 1e-12))
 
 
-def validate_report(path):
+def validate_report(path, single_crop=False):
     report = json.loads(path.read_text(encoding='utf8'))
     protocol = report['protocol']
     if report.get('status') != 'complete' or report.get('unchanged_detector_tensors', 0) <= 0:
@@ -71,8 +71,14 @@ def validate_report(path):
     if not report.get('initial_equivalence', {}).get('passed'):
         raise ValueError('Initial held-prompt equivalence must have passed')
     if (any(protocol.get(k) is not True for k in ('no_training', 'no_score_gate', 'no_target_threshold_tuning'))
-            or protocol.get('crops_per_variant') != 2 or protocol.get('fusion_weight') != .5):
-        raise ValueError('Expected the fixed two-crop/no-gate selection protocol')
+            or protocol.get('crops_per_variant') != (1 if single_crop else 2)
+            or protocol.get('fusion_weight') != .5):
+        raise ValueError('Expected the fixed %s-crop/no-gate selection protocol' % ('single' if single_crop else 'two'))
+    if single_crop and (protocol.get('experiment') != 'matched_budget_single_crop_selection'
+            or protocol.get('geometry_validity_requires_second_crop_prediction') is not False
+            or protocol.get('background_alignment_used') is not False
+            or protocol.get('reference_map_mapping') != {'baseline': 'baseline', 'adaptive': 'single_a'}):
+        raise ValueError('Expected the matched-support primary-A single-selection protocol')
     name = report['testing_data']
     if not isinstance(name, str) or not name or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789_-' for c in name):
         raise ValueError('Unsafe dataset name')
