@@ -458,6 +458,61 @@ The reused source images were held out only from the pilot gate fit; they are
 not baseline-unseen validation. Keep this diagnostic separate from final target
 evaluation and do not select deployment gates using its per-image labels.
 
+#### Per-layer visual Prompt sensitivity (no training)
+
+This extends the Value-contribution diagnostic with ten paired forwards per
+image: the real add baseline, its shared-gate=1 equivalence control, and separate
+amplitude/contribution=0.5 interventions at visual injection blocks L1-L4.
+Only one block is directly changed per intervention; the text branch remains at
+baseline. These blocks are **not** the feature readout layers 6/12/18/24. Earlier
+changes can propagate into later blocks. This tests layer sensitivity, not a
+trained router or a new Prompt generator.
+
+Synchronize `test.py`, `tools/prompt_contribution_diagnostics.py`, and `README.md`.
+Run from the server repository root:
+
+```bash
+python test.py \
+  --fusion_mode shared_gate --load_baseline --diagnose_prompt_contribution \
+  --prompt_contribution_scope layerwise \
+  --contribution_pixel_threshold 0.0030400758755857304 \
+  --ckt_path ./workspaces/baseline_111/models/0s-pretrained-mvtec-colondb-ViT-L-14-336-SD-VL-D4-L5-HSF-K20-Fadd-W0-S111_epoch_5.pth \
+  --contribution_reference_report ./workspaces/baseline_gate_111_direct_pilot/diagnostics/direct_gate_pilot.json \
+  --batch_size 1 \
+  --save_path ./workspaces/baseline_111_prompt_layer_sensitivity
+```
+
+The threshold above is the existing MVTec source-normal operating point from
+`source_single_utility_summary.json` (desired normal pixel FPR 0.001). It is an
+explicit, frozen input, never re-fitted on these diagnostic images. Use it only
+with the same baseline and preprocessing. Other checkpoints require their own
+independently source-calibrated threshold.
+
+Detection metrics use the native evaluation order: interpolate raw logits,
+average layers, then softmax and apply Gaussian sigma=4 once. They reuse the
+current forward's actual features, without a second encoder or HSF invocation.
+Training-mode per-layer probability maps are not averaged to approximate the
+final map. Normal false-positive pixels use the same strict `score > threshold`
+rule in every intervention. No per-image min-max normalization is applied.
+
+The JSON adds per-image localization AP, normal pixel FPR, and GT defect-area
+groups after preprocessing: small <=1%, medium >1% and <=5%, large >5%.
+Masks are used only for measurement/grouping, never for model control. AP is
+undefined for empty masks. Summary AP is the mean AP of anomalous images, **not
+the class-macro pooled P-AP reported by full benchmark evaluation**. The report
+also records baseline per-readout-layer metrics and post-hoc best-layer counts
+with ties. These counts use GT and cannot be treated as a deployable selector.
+
+Send both files after the log says `Prompt layer sensitivity: DONE`:
+
+- `workspaces/baseline_111_prompt_layer_sensitivity/diagnostics/source_prompt_layer_sensitivity.json`
+- `workspaces/baseline_111_prompt_layer_sensitivity/logs/source_prompt_layer_sensitivity.txt`
+
+This reuses the earlier pilot's source-validation identities for a controlled
+comparison; they are not independent of earlier exploratory analyses or unseen
+by the base detector. Do not use them to claim target generalization. All
+existing parameter/RNG checks, exception cleanup, and overwrite guards remain.
+
 #### Prompt-scale diagnosis (no training)
 
 After verifying baseline equivalence, inspect why fixed gates 0.5 and 1 may have

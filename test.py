@@ -34,8 +34,10 @@ def train(args):
     if contribution:
         from tools.prompt_contribution_diagnostics import validate_args
         validate_args(args)
-    elif getattr(args, 'contribution_reference_report', None):
-        raise ValueError('--contribution_reference_report requires --diagnose_prompt_contribution')
+    elif (getattr(args, 'contribution_reference_report', None)
+          or getattr(args, 'prompt_contribution_scope', 'all') != 'all'
+          or getattr(args, 'contribution_pixel_threshold', None) is not None):
+        raise ValueError('Prompt contribution options require --diagnose_prompt_contribution')
     compare_shapes = getattr(args, 'compare_loss_shapes', False)
     reference_path = getattr(args, 'source_reference_report', None)
     if compare_shapes and (not args.diagnose_source_losses or not reference_path):
@@ -83,8 +85,9 @@ def train(args):
 
     # Logger
     if contribution:
+        from tools.prompt_contribution_diagnostics import report_name
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
-        logger = Logger(os.path.join(args.save_path, 'logs', 'source_prompt_contribution.txt'))
+        logger = Logger(os.path.join(args.save_path, 'logs', report_name(args) + '.txt'))
     elif feature_adapter != 'none':
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         logger = Logger(os.path.join(args.save_path, 'logs', f'{args.testing_data}_feature_{feature_adapter}.txt'))
@@ -350,6 +353,10 @@ if __name__ == '__main__':
                         help='Read-only source diagnostic of visual prompt Value contribution; no training')
     parser.add_argument('--contribution_reference_report', default=None,
                         help='Existing direct_gate_pilot.json; reuse its exact validation image identities')
+    parser.add_argument('--prompt_contribution_scope', choices=['all', 'layerwise'], default='all',
+                        help='All-layer legacy probe or separate visual L1-L4 sensitivity probes')
+    parser.add_argument('--contribution_pixel_threshold', type=float, default=None,
+                        help='Previously source-calibrated pixel threshold; required for layerwise diagnosis')
     parser.add_argument(
         "--compare_loss_shapes", action="store_true",
         help="Also compute batch-preserving loss from identical predictions; source diagnostic only",
