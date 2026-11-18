@@ -9,6 +9,7 @@ from tools import visualization, calculate_metric, calculate_average_metric
 from tools.gate_equivalence import _rng_state, _restore_rng
 from .adaclip import *
 from .custom_clip import create_model_and_transforms
+from .text_prototype import TextPrototypeAdapter
 
 
 class AdaCLIP_Trainer(nn.Module):
@@ -31,6 +32,7 @@ class AdaCLIP_Trainer(nn.Module):
 
         self.device = device
         self.feat_list = feat_list
+        self.output_dim = output_dim
         self.image_size = image_size
         self.fusion_mode = fusion_mode
         if gate_learning_rate <= 0:
@@ -213,6 +215,56 @@ class AdaCLIP_Trainer(nn.Module):
                for name, value in state.items()):
             raise RuntimeError("Baseline checkpoint was not copied exactly")
         return len(expected)
+
+    def attach_text_prototypes(self, mode):
+        # Keep data order and evaluation RNG independent of the number of adapters.
+        with torch.random.fork_rng(devices=[]):
+            adapter = TextPrototypeAdapter(self.output_dim, mode)
+        self.clip_model.text_prototype_adapter = adapter.to(self.device)
+        return self.clip_model.text_prototype_adapter
+
+    def train_text_prototype_epoch(self, loader, optimizer, normal_weight):
+        self.clip_model.eval()
+        adapter = self.clip_model.text_prototype_adapter
+        adapter.train()
+        totals = np.zeros(3)
+        for items in loader:
+            image = items["img"].to(self.device)
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                image_features, patches, text = self.clip_model.extract_feat(image, items["cls_name"])
+                baseline = self.clip_model.patch_match_logits(patches, text)
+
+            baseline = [logits.float() for logits in baseline]
+            adapted = adapter(patches, text, image_features, baseline)
+            maps = self.clip_model.resize_patch_logits(adapted)
+            target = (items["img_mask"].to(self.device)[:, 0] > 0.5).float()
+            segmentation = []
+            for logits in maps:
+                probabilities = logits.softmax(dim=1)
+                segmentation.append(
+                    self.loss_focal(probabilities, target)
+                    + self.loss_dice(probabilities[:, 1], target)
+                    + self.loss_dice(probabilities[:, 0], 1 - target)
+                )
+            task_loss = torch.stack(segmentation).mean()
+            normal_loss = task_loss.new_zeros(())
+            if normal_weight > 0:
+                baseline_maps = self.clip_model.resize_patch_logits(baseline)
+                before = torch.stack(baseline_maps).mean(dim=0).softmax(dim=1)[:, 1]
+                after = torch.stack(maps).mean(dim=0).softmax(dim=1)[:, 1]
+                normal = 1 - target
+                normal_loss = ((after - before).relu().square() * normal).sum() / normal.sum().clamp_min(1)
+            loss = task_loss + normal_weight * normal_loss
+            if not torch.isfinite(loss):
+                raise RuntimeError("Non-finite text prototype training loss")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            totals += (loss.item(), task_loss.item(), normal_loss.item())
+
+        if not len(loader):
+            raise ValueError("Text prototype training source is empty")
+        return totals / len(loader)
 
     def detection_loss(self, anomaly_map, anomaly_score, items, return_components=False,
                        preserve_batch_dim=False):

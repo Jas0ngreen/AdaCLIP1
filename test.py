@@ -15,6 +15,7 @@ import cv2
 from tools import write2csv, setup_seed, Logger
 from dataset import get_data, dataset_dict
 from method import AdaCLIP_Trainer
+from method.text_prototype import PROTOTYPE_MODES, prototype_baseline_signature
 from PIL import Image
 import numpy as np
 
@@ -23,6 +24,18 @@ setup_seed(111)
 def train(args):
     assert os.path.isfile(args.ckt_path), f"Please check the path of pre-trained model, {args.ckt_path} is not valid."
     contribution = getattr(args, 'diagnose_prompt_contribution', False)
+    prototype_path = getattr(args, "prototype_checkpoint", None)
+    prototype = None
+    if prototype_path:
+        if (args.fusion_mode != "add" or args.load_baseline or args.gate_override is not None
+                or args.check_gate_equivalence or args.diagnose_prompt_scale
+                or args.diagnose_source_losses or contribution):
+            raise ValueError("Text prototype evaluation requires standard add baseline inference")
+        prototype = torch.load(prototype_path, map_location="cpu")
+        if prototype["mode"] not in PROTOTYPE_MODES:
+            raise ValueError("Invalid text prototype mode in checkpoint")
+        if prototype["baseline"] != prototype_baseline_signature(args):
+            raise ValueError("Text prototype checkpoint requires the same baseline file and detector settings used for training")
     if contribution:
         from tools.prompt_contribution_diagnostics import validate_args
         validate_args(args)
@@ -74,7 +87,11 @@ def train(args):
     save_fig = args.save_fig
 
     # Logger
-    if contribution:
+    if prototype is not None:
+        os.makedirs(os.path.join(args.save_path, "logs"), exist_ok=True)
+        logger = Logger(os.path.join(args.save_path, "logs",
+                                     f"{args.testing_data}_text_prototype_{prototype['mode']}.txt"))
+    elif contribution:
         os.makedirs(os.path.join(args.save_path, 'logs'), exist_ok=True)
         logger = Logger(os.path.join(args.save_path, 'logs', 'source_prompt_contribution.txt'))
     elif args.diagnose_source_losses:
@@ -123,7 +140,11 @@ def train(args):
         fusion_mode=args.fusion_mode,
     ).to(device)
 
-    if args.load_baseline:
+    if prototype is not None:
+        model.load(args.ckt_path, require_complete=True)
+        adapter = model.attach_text_prototypes(prototype["mode"])
+        adapter.load_state_dict(prototype["state_dict"])
+    elif args.load_baseline:
         count = model.load_baseline_for_shared_gate(args.ckt_path)
         logger.info(f'Baseline import PASS: {count} detector tensors copied exactly; gate is untrained.')
     else:
@@ -166,7 +187,9 @@ def train(args):
         csv_root = os.path.join(save_root, 'csvs')
         image_root = os.path.join(save_root, 'images')
         suffix = ''
-        if args.fusion_mode == "shared_gate":
+        if prototype is not None:
+            suffix = f"_text_prototype_{prototype['mode']}"
+        elif args.fusion_mode == "shared_gate":
             gate_label = (
                 "learned" if args.gate_override is None
                 else f"fixed_{args.gate_override:g}"
@@ -269,6 +292,8 @@ if __name__ == '__main__':
     parser.add_argument("--ckt_path", type=str, default='weights/pretrained_mvtec_colondb.pth',
                         help="Path to the pre-trained model (default: weights/pretrained_mvtec_colondb.pth)")
 
+    parser.add_argument("--prototype_checkpoint",
+                        help="Text prototype weights trained from the baseline in --ckt_path")
     parser.add_argument("--testing_model", type=str, default="dataset", choices=["dataset", "image"],
                         help="Model for testing (default: 'dataset')")
 

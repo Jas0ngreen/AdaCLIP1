@@ -502,6 +502,7 @@ class AdaCLIP(nn.Module):
             self.enable_visual_prompt = False
 
         self.text_embedding_layer = TextEmbebddingLayer(fixed=(not self.enable_text_prompt))
+        self.text_prototype_adapter = None
         # self.text_prompter = PromptLayer(text_channel, prompting_length, prompting_depth, is_text=True,
         #                                  prompting_type=prompting_type,
         #                                  enabled=self.enable_text_prompt)
@@ -738,12 +739,7 @@ class AdaCLIP(nn.Module):
         return x
 
     def visual_text_similarity(self, image_feature, patch_token, text_feature, aggregation):
-
-        anomaly_maps = []
-
-        for layer in range(len(patch_token)):
-            anomaly_map = (100.0 * patch_token[layer] @ text_feature)
-            anomaly_maps.append(anomaly_map)
+        anomaly_maps = self.patch_match_logits(patch_token, text_feature)
 
         if self.use_hsf:
             alpha = 0.2
@@ -758,12 +754,10 @@ class AdaCLIP(nn.Module):
         anomaly_score = anomaly_score.squeeze(1)
         anomaly_score = torch.softmax(anomaly_score, dim=1)
 
-        # NOTE: this bilinear interpolation is not unreproducible and may occasionally lead to unstable ZSAD performance.
-        for i in range(len(anomaly_maps)):
-            B, L, C = anomaly_maps[i].shape
-            H = int(np.sqrt(L))
-            anomaly_maps[i] = anomaly_maps[i].permute(0, 2, 1).view(B, 2, H, H)
-            anomaly_maps[i] = F.interpolate(anomaly_maps[i], size=self.image_size, mode='bilinear', align_corners=True)
+        # HSF uses the original scores to select patches for image classification.
+        if self.text_prototype_adapter is not None:
+            anomaly_maps = self.text_prototype_adapter(patch_token, text_feature, image_feature, anomaly_maps)
+        anomaly_maps = self.resize_patch_logits(anomaly_maps)
 
         if aggregation:  # in the test stage, we firstly aggregate logits from all hierarchies and then do the softmax normalization
             anomaly_map = torch.mean(torch.stack(anomaly_maps, dim=1), dim=1)
@@ -776,6 +770,19 @@ class AdaCLIP(nn.Module):
             for i in range(len(anomaly_maps)):
                 anomaly_maps[i] = torch.softmax(anomaly_maps[i], dim=1)
             return anomaly_maps, anomaly_score
+
+    @staticmethod
+    def patch_match_logits(patch_tokens, text_features):
+        return [100.0 * patches @ text_features for patches in patch_tokens]
+
+    def resize_patch_logits(self, logits):
+        maps = []
+        for scores in logits:
+            batch, count, channels = scores.shape
+            side = int(np.sqrt(count))
+            grid = scores.permute(0, 2, 1).view(batch, channels, side, side)
+            maps.append(F.interpolate(grid, size=self.image_size, mode='bilinear', align_corners=True))
+        return maps
 
     def extract_feat(self, image, cls_name, gate_override=None):
         if "D" in self.prompting_type and not self.static_only:

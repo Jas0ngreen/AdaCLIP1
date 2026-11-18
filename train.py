@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import argparse
 import json
+import math
 import os
 import torch
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 from tools import write2csv, setup_paths, setup_seed, log_metrics, Logger
 from dataset import get_data
 from method import AdaCLIP_Trainer
+from method.text_prototype import PROTOTYPE_MODES, prototype_baseline_signature
 
 # TODO 最后代码完成删掉
 #setup_seed(111)
@@ -45,6 +47,38 @@ def validate_gate_resume(args):
         args.resume_gate_from = str(source)
 
 
+def train_text_prototypes(model, args, run_dir, logger):
+    signature = prototype_baseline_signature(args)
+    model.load(args.ckt_path, require_complete=True)
+    model.requires_grad_(False)
+    frozen = [(parameter, parameter._version) for parameter in model.parameters()]
+    adapter = model.attach_text_prototypes(args.prototype_mode)
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.learning_rate, weight_decay=0.0)
+    count = sum(parameter.numel() for parameter in adapter.parameters())
+    logger.info(f"Training {count} text prototype parameters on source data")
+
+    _, source, source_root = get_data(
+        dataset_type_list=args.training_data, transform=model.preprocess,
+        target_transform=model.transform, training=True,
+    )
+    logger.info(f"Source data root: {source_root}")
+    loader = DataLoader(source, batch_size=args.batch_size, shuffle=True)
+    for epoch in tqdm(range(args.epoch), desc="text prototype training"):
+        total, task, normal = model.train_text_prototype_epoch(
+            tqdm(loader, desc=f"epoch {epoch + 1}", leave=False), optimizer, args.prototype_normal_weight,
+        )
+        if any(parameter._version != version or parameter.grad is not None for parameter, version in frozen):
+            raise RuntimeError("A frozen AdaCLIP parameter was modified")
+        if any(not torch.isfinite(parameter).all() for parameter in adapter.parameters()):
+            raise RuntimeError("Non-finite text prototype weights")
+        logger.info(f"Epoch {epoch + 1}/{args.epoch} loss={total:.6f} "
+                    f"segmentation={task:.6f} normal_penalty={normal:.6f}, frozen parameters verified")
+
+    checkpoint = run_dir / "text_prototype_final.pth"
+    torch.save({"mode": adapter.mode, "baseline": signature, "state_dict": adapter.state_dict()}, checkpoint)
+    logger.info(f"Text prototype checkpoint: {checkpoint}")
+
+
 def train(args):
     validate_gate_resume(args)
     from_baseline = bool(getattr(args, 'gate_from_baseline', ''))
@@ -67,6 +101,16 @@ def train(args):
         if args.gate_task_weight < 0:
             raise ValueError("--gate_task_weight must be nonnegative")
     setup_seed(args.seed)
+    prototype_mode = getattr(args, "prototype_mode", None)
+    if prototype_mode:
+        if args.fusion_mode != "add" or args.batch_size != 1 or args.static_warmup_epochs != 0:
+            raise ValueError("Text prototype training requires add fusion, batch size 1 and no prompt warm-up")
+        if args.epoch < 1 or not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+            raise ValueError("Text prototype training requires positive epochs and learning rate")
+        if not math.isfinite(args.prototype_normal_weight) or args.prototype_normal_weight < 0:
+            raise ValueError("--prototype_normal_weight must be finite and nonnegative")
+        if not Path(args.ckt_path).is_file():
+            raise FileNotFoundError("Supply the add baseline checkpoint via --ckt_path")
 
     # Configurations
     epochs = args.epoch
@@ -78,7 +122,13 @@ def train(args):
     save_fig = args.save_fig
 
     # Set up paths
-    model_name, image_dir, csv_path, log_path, ckp_path, tensorboard_logger = setup_paths(args)
+    if prototype_mode:
+        run_dir = Path(args.save_path) / f"text_prototype_{prototype_mode}_s{args.seed}"
+        run_dir.mkdir(parents=True, exist_ok=False)
+        log_path = str(run_dir / "train.txt")
+        model_name = run_dir.name
+    else:
+        model_name, image_dir, csv_path, log_path, ckp_path, tensorboard_logger = setup_paths(args)
     # Logger
     logger = Logger(log_path)
 
@@ -116,6 +166,10 @@ def train(args):
         fusion_mode=args.fusion_mode,
         gate_learning_rate=args.gate_learning_rate,
     ).to(device)
+
+    if prototype_mode:
+        train_text_prototypes(model, args, run_dir, logger)
+        return
 
     if from_baseline:
         count = model.load_baseline_for_shared_gate(args.gate_from_baseline)
@@ -324,6 +378,10 @@ if __name__ == '__main__':
     parser.add_argument("--save_fig", type=str2bool, default=False,
                         help="Save figures for visualizations (default: False)")
     parser.add_argument("--ckt_path", type=str, default='', help="Path to the pre-trained model (default: '')")
+    parser.add_argument("--prototype_mode", choices=PROTOTYPE_MODES,
+                        help="Train just a text prototype adapter from the add baseline in --ckt_path")
+    parser.add_argument("--prototype_normal_weight", type=float, default=0.0,
+                        help="Weight of the source normal-pixel one-sided penalty")
 
     # Hyper-parameters
     parser.add_argument("--exp_indx", type=int, default=0, help="Index of the experiment (default: 0)")
